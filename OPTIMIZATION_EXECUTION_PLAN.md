@@ -1,6 +1,6 @@
 # GLM-5.3 并发与速度优化：快速验证执行方案
 
-状态：**资深二次复核 APPROVE；Batch 1 已于 2026-09-02 启动执行**
+状态：**资深二次复核 APPROVE；Batch 1 已于 2026-09-02 执行完成（无候选晋级）**
 计划基线：commit `5bd3f5f8`，GPU 0–3，端口 30002  
 适用硬件：4× CMP 170HX / SM80；不修改 GPU 功耗、时钟或硬件拓扑
 
@@ -14,6 +14,13 @@ fail-closed 保护。
 候选的中途决策。批准后由本地 runner 按预先冻结的 manifest 自动执行、判定和
 恢复；Codex 只在批次开始前审查一次，在批次结束后复核一次。这样可以避免等待
 智能体响应成为测试链路的一部分。
+
+Batch 1 收尾记录：三个 PP4 分层候选均在 L3 门禁淘汰，未改变正式配置。首次
+恢复 formal 时发现 runner 将 formal 配置误当作候选访问 `id`，在服务已经健康
+监听后产生误报 `ABORT_REVIEW`。提交 `db63d808` 按 `child_role` 区分 formal/
+candidate，并加入回归测试；资深 reviewer 二次批准 recovery-only 收尾。formal
+已只读核验通过（`0.0.0.0:30002`、`/health=200`、512K max context），原始
+`ABORT_REVIEW` 保留作审计，详细结果见批次目录的 `RECOVERY_VERIFIED.json`。
 
 ## 0. 智能体参与边界（低介入模式）
 
