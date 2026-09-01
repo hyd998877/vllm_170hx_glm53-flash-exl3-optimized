@@ -6,6 +6,37 @@
 
 本文的目的不是把所有候选直接跑一遍完整的 `6×128K`，而是在不牺牲正确性和结论可信度的前提下，用逐级门禁快速淘汰无效方案。只有通过便宜代理测试的候选，才进入昂贵的 128K 正式测试。
 
+本版特别采用**低介入批处理模式**：Codex 不参与每个请求、每个日志片段或每个
+候选的中途决策。批准后由本地 runner 按预先冻结的 manifest 自动执行、判定和
+恢复；Codex 只在批次开始前审查一次，在批次结束后复核一次。这样可以避免等待
+智能体响应成为测试链路的一部分。
+
+## 0. 智能体参与边界（低介入模式）
+
+| 时点 | Codex/用户做什么 | 测试期间谁负责 |
+|---|---|---|
+| 批次开始前（一次） | 审查候选、门槛、GPU/PID 范围、回滚命令；用户批准批次 | 不再临时改参数 |
+| 批次执行中 | 不参与；只在 runner 明确触发 `ABORT_REVIEW` 时介入 | runner、HTTP 客户端、日志/指标采集器 |
+| 批次结束后（一次） | 审核汇总、确认冠军和下一批；决定是否发布 | runner 已完成清理和正式服务恢复 |
+
+`ABORT_REVIEW` 只允许以下情况触发：检测到未知 PID/端口占用、GPU4–7 业务状态
+变化、数据格式损坏、连续两次结果波动超过 5%、或出现未列入策略的错误。OOM、
+HTTP 超时、Waiting/Deferred、JIT 警告和候选性能回退均按预设规则自动记录并跳过，
+不等待智能体解释。
+
+### 0.1 runner 的安全状态机
+
+```text
+PRECHECK → SNAPSHOT → START_CANDIDATE → HEALTHY
+    → L2 → L3(repeat) → L4(optional) → DECIDE
+    → NEXT_CANDIDATE → RESTORE_FORMAL → BATCH_REPORT
+```
+
+任何节点失败都进入 `CLEANUP`，只清理 manifest 中记录的候选 PID 和临时目录；
+不会使用 `killall`、不会杀掉未知 vLLM 进程，也不会自动停止 GPU4–7 上的服务。
+`RESTORE_FORMAL` 必须通过 `/health`、端口、模型名和 GPU PID 四项检查后，runner
+才退出成功。恢复失败直接 `ABORT_REVIEW`，不继续后续批次。
+
 ## 1. 目标、边界和当前基线
 
 优化目标分为三类，不能用一个吞吐数字混在一起：
@@ -79,6 +110,18 @@
 
 低于门槛的差异记为噪声或失败，不继续 128K。若局部收益很大而服务级结果刚好低于门槛，仅允许一次“交互救援测试”，避免无限组合搜索。
 
+### 2.3 自适应重复次数和按机制选 workload
+
+不再对每个候选机械地跑相同次数：
+
+- L3 先跑两次。若候选相对基线差异大于 8%、两次离散小于 2%，直接晋级或淘汰；只有接近门槛或离散较大时才跑第三次。
+- decode-only 候选不重复跑两个短 prefill workload：L3 后直接跑 `6×32K→512`。
+- prefill/KV 候选不浪费长输出：跑 `6×8K/32K→64`，只有晋级才补 512 输出。
+- prefix-cache 候选使用冷/热配对，不纳入独立冷请求速度排名。
+- 容量候选先按 ledger 淘汰，再做 8 路；理论预算不足时不发送注定排队的请求。
+
+基线在每三个候选后插入一次短复测。若前后基线漂移超过 3%，runner 自动把该区间标为 `inconclusive` 并仅重跑该区间；不请求 Codex 临时判断。
+
 ## 3. 避免组合爆炸的实验设计
 
 不做 PP 分层 × TP/PP × MBT × max-seqs × DFlash k 的全因子排列。采用 `champion/challenger` 连续搜索：
@@ -90,6 +133,26 @@
 5. 最后只组合已经独立获胜且机制不冲突的优化。
 
 这样会牺牲穷举所有高阶交互，但能把几十到上百个长测压缩为 2–4 个正式 128K 候选。发现强交互证据时，再增加一组定向组合，而不是展开整个笛卡尔积。
+
+### 3.1 按“是否需要重载模型”分组
+
+为了进一步减少 5.5 分钟的加载成本，候选分为三类：
+
+| 类别 | 例子 | 执行方式 |
+|---|---|---|
+| R0 请求级 | prompt 长度、并发、prose/code、prefix 冷/热 | 同一服务连续运行 |
+| R1 idle 时可切换 | benchmark-only 的 k policy、MBT 上限内配额、kernel dispatch、计时开关 | 通过仅监听本机 Unix socket 的 allowlist 控制面切换；每次切换前确认 Running=Waiting=0 |
+| R2 必须重启 | PP/TP、PP 分层、KV dtype/page、CUDA Graph 内存形状、权重布局 | 一个配置只加载一次，加载后连续跑完其全部 L2–L4 |
+
+R1 控制面只存在于实验分支，不开放 TCP，不允许修改模型路径、GPU、端口、显存比例或任意环境变量。先对一个 sentinel 候选比较“运行时切换”和“干净重启”；差异超过 2% 就禁用 R1，全部回到 R2。正式 128K 验收始终使用干净重启的单一冠军配置，避免状态污染。
+
+源码 kernel 候选可在同一实验二进制中保留 baseline/candidate 两条 allowlist dispatch 路径，先在一次加载中筛选；只有胜出实现才 cherry-pick 到干净 release-candidate 分支并正式重启。这是测试工具，不改变最终部署路径。
+
+### 3.2 冻结 manifest，runner 自主选择冠军
+
+每批开始前生成不可变 manifest，记录候选依赖、晋级门槛、最大重启数、超时和正式恢复配置。runner 使用确定性规则执行 successive halving：L3 淘汰下半区，L4 最多保留两个，每类最多一个进入 L5。运行期间不调用模型、Codex 或外部决策服务。
+
+manifest 的 SHA256 写入所有结果。批次开始后不允许 Codex边看结果边增加候选；新想法进入下一份 manifest，从而避免测试过程中不断改变目标。
 
 ## 4. 各优化方向的快速验证方式
 
@@ -120,10 +183,13 @@
 
 - 为 benchmark 增加 prompt seed、结果 schema 校验和 prefix hit delta。
 - 增加自动健康检查、超时、日志错误扫描、Prometheus 快照和 GPU/CPU 采样。
+- 增加 manifest 解析、确定性晋级、原子状态文件、独立进程运行和正式服务恢复。
 - 在当前正式服务上做 L2 和一组 L3，验证快速代理结果可复现。
 - 采集 CUDA event 分段基线：prefill、draft、verify、selector/rejection、PP send/recv。
 
 预算：30–60 分钟开发/校准；服务测试约 5 分钟。
+
+Batch 0 完成后，配置筛选 Batch 1–3 作为一份 manifest 连续无人值守执行；中间不等待 Codex 回复。runner 会把上一轮冠军自动代入下一类候选，最终恢复正式服务并生成一次总报告。
 
 ### Batch 1：PP4 分层 successive halving
 
@@ -160,6 +226,8 @@
 
 每个功能服务级筛选最多一次重启；未过 L3/L4 就不合并。源码实现时间取决于问题复杂度，和 GPU 测试预算分开记录。
 
+Codex 只负责实现代码和在运行前把候选加入 manifest。测试启动以后不再通过工具逐条发送请求或人工看日志决定下一步；runner 独立完成该功能的 L0–L4，并返回单个 `DONE` 或 `ABORT_REVIEW` 状态。
+
 ### Batch 5：胜出组合和正式验收
 
 - 只合并机制兼容且单项已晋级的候选，形成一个 release candidate。
@@ -189,6 +257,8 @@
 
 如果 GPU4–7 的现有业务后来明确允许停止，可开第二条 PP4 测试 lane（建议端口 30003）缩短墙钟时间。两条 lane 必须各跑自己的 paired baseline，不能把 GPU0–3 的基线直接用于 GPU4–7；未经明确许可，不停止当前 GPU4–7 上的 DeepSeek 服务。
 
+低介入模式把 Codex 的测试决策次数从“每候选/每级一次”降为“每批两次”。R1 运行时切换若通过 sentinel 等价性验证，预计还可少 2–4 次模型重载。对应的目标墙钟时间为：配置筛选约 60–100 分钟，已实现源码候选的快速筛选每项约 5–15 分钟，最终正式验收约 45–75 分钟。研发编码时间仍单独计算。
+
 ## 7. 自动化、结果目录和可复现性
 
 计划执行前增加一个 fail-fast runner。每个实验写入独立目录：
@@ -196,6 +266,10 @@
 ```text
 /mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-YYYYMMDD/
   manifest.json          # commit、branch、模型 hash、参数、环境、GPU 拓扑
+  manifest.sha256
+  STATUS.json            # 原子更新：当前候选、阶段、已用时间、最近心跳
+  events.jsonl           # runner 的结构化事件，不依赖 Codex 对话记录
+  runner.pid
   baseline/
   A1-p13111110/
     launch.env
@@ -209,6 +283,7 @@
     decision.md
   summary.json
   RESULTS.md
+  DONE                    # 成功完成；或 ABORT_REVIEW
 ```
 
 runner 对每个候选执行：
@@ -220,6 +295,17 @@ runner 对每个候选执行：
 5. 扫描 OOM、Waiting、Deferred、engine dead、HTTP failure、运行期 JIT。
 6. 写入 `promoted/rejected/inconclusive`，只有 `promoted` 才进入下一层。
 7. 实验结束恢复已验证正式参数，并复核文本、视觉和 `/health`。
+
+runner 作为独立本地进程运行，不依附 Codex 的 shell/PTY 生命周期。Codex 启动后即可退出当前交互，不做高频轮询；需要查看状态时只读取一次 `STATUS.json`。runner 每 10 秒原子更新心跳，单个请求和单次启动都有硬超时，主机重启或 runner 异常退出后可根据 manifest 和 PID 快照幂等恢复。
+
+确定性自动判定包括：
+
+- `reject_continue`：正确性失败、OOM、超时、Waiting/Deferred、性能低于淘汰线；清理候选并继续。
+- `promote_continue`：达到门槛，进入下一层或替换当前冠军。
+- `inconclusive_retry_once`：基线漂移或结果落在不确定区间，只自动复测一次。
+- `abort_restore`：未知 PID、保护 GPU 被触碰、结果 schema 损坏或正式服务无法恢复；停止整批、先恢复再等待复核。
+
+runner 不修改代码、不创建 git commit、不 push、不自行扩大候选集合，也不会根据日志文本生成新的优化方案。这样测试速度不受智能体推理速度影响，同时把研发判断和机械执行清晰分开。
 
 所有源码实验遵循：
 
@@ -248,6 +334,6 @@ main（已验证）
 
 ## 9. 批准后实际开始点
 
-批准本计划后，先执行 Batch 0，只增加 benchmark/runner、计时开关和实验分支，不改变正式算法。Batch 0 的代理测试稳定后再开始第一次服务重启。若代理结果本身波动超过 5%，先修正测量方法，不继续参数搜索。
+批准本计划后，先执行 Batch 0，只增加 benchmark/runner、计时开关和实验分支，不改变正式算法。runner 的定向单测、dry-run 和一次故障恢复演练通过后，自动开始 Batch 1–3 配置 campaign；中间不需要 Codex 或用户逐项确认。若代理结果本身波动超过 5%，runner 自动复测一次，仍不稳定则恢复正式服务并生成 `ABORT_REVIEW`。
 
-第一次阶段汇报节点设在 Batch 1 结束：届时会提交基线校准、三个 PP 分层的 ledger/L3/L4 结果、淘汰原因、剩余预算和是否值得继续 PP2×TP2。未经批准，当前 30002 服务保持不变。
+第一次阶段汇报节点改为 Batch 1–3 整批结束：届时一次性提交基线校准、PP 分层、PP2×TP2/PP1×TP4、MBT、接纳容量的 ledger/L3/L4 结果、自动淘汰原因和当前冠军。Batch 4 每个已实现源码功能同样按“一次启动、一次结果”执行，不在测试中间等待智能体。未经批准，当前 30002 服务保持不变。
