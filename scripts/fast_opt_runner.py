@@ -478,9 +478,10 @@ class Campaign:
                 f"unexpected formal socket fingerprint: {self.socket_fingerprint}"
             )
         gpu_processes = gpu_compute_processes()
-        self.protected_gpu_snapshot = {
-            gpu: set(gpu_processes.get(gpu, set())) for gpu in range(4, 8)
-        }
+        if self.protected_gpu_snapshot is None:
+            self.protected_gpu_snapshot = {
+                gpu: set(gpu_processes.get(gpu, set())) for gpu in range(4, 8)
+            }
         self.verify_gpu_ownership(identity, gpu_processes)
         self.formal_identity = identity
         self.event("formal_verified", pid=pid, identity=dataclasses.asdict(identity))
