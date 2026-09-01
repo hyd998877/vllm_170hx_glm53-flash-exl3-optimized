@@ -22,6 +22,11 @@ OpenAI 兼容接口、512K 请求上限和多模态输入。
 该项目针对特定 checkpoint、硬件和负载优化，不应理解为对所有模型或所有请求
 形状都更快。
 
+下一阶段并发、PP/TP、DFlash、KV 和 kernel 优化采用逐级淘汰方案，避免对每个
+候选重复运行耗时的完整 128K 测试。执行门槛、时间预算和结果格式见
+[OPTIMIZATION_EXECUTION_PLAN.md](OPTIMIZATION_EXECUTION_PLAN.md)。该文档当前为
+待批准计划，不表示其中候选已经验证通过。
+
 ## 主要改进
 
 - GLM-5.3 routed experts 的选择性 EXL3 K4/MCG reader。
