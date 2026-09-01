@@ -1183,12 +1183,7 @@ class Campaign:
         except BaseException as exc:  # noqa: BLE001
             self.event("ABORT_REVIEW", reason=str(exc))
             try:
-                bindings = port_bindings(30002)
-                child_is_loopback_owner = bool(
-                    self.child
-                    and bindings == [("127.0.0.1", self.child.pid)]
-                )
-                if child_is_loopback_owner and self.child_role == "candidate":
+                if self.child and self.child_role == "candidate":
                     self.stop_child()
                 if (
                     port_pid(30002) is None
