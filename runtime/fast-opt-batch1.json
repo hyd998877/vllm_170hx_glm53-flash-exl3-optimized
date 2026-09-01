@@ -1,7 +1,7 @@
 {
   "name": "fast-opt-batch1-pp4-partition",
   "max_campaign_s": 21600,
-  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260901/batch1-rerun",
+  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260901/batch1-exec-2350",
   "base_env": {
     "PYTHON_BIN": "/mnt/nvme0/keys-vllm-glm53/.venv/bin/python",
     "MODEL": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
