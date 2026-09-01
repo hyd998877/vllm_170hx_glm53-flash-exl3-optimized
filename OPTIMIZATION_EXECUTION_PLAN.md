@@ -4,6 +4,10 @@
 计划基线：commit `5bd3f5f8`，GPU 0–3，端口 30002  
 适用硬件：4× CMP 170HX / SM80；不修改 GPU 功耗、时钟或硬件拓扑
 
+本计划在 2026-09-01 经资深推理系统/性能工程师复核后修订。修订重点是：未实现
+的热切换默认关闭、补充 128K 短探针、提高重复测量要求，以及对进程和 GPU 的
+fail-closed 保护。
+
 本文的目的不是把所有候选直接跑一遍完整的 `6×128K`，而是在不牺牲正确性和结论可信度的前提下，用逐级门禁快速淘汰无效方案。只有通过便宜代理测试的候选，才进入昂贵的 128K 正式测试。
 
 本版特别采用**低介入批处理模式**：Codex 不参与每个请求、每个日志片段或每个
@@ -23,6 +27,21 @@
 变化、数据格式损坏、连续两次结果波动超过 5%、或出现未列入策略的错误。OOM、
 HTTP 超时、Waiting/Deferred、JIT 警告和候选性能回退均按预设规则自动记录并跳过，
 不等待智能体解释。
+
+审查确定的 P0/P1 修订：
+
+- P0：仓库当前没有 R1 Unix-socket 控制面；`k`、MBT、CUDA Graph 形状等也并非
+  通用热切换参数。R1 在实现并通过 sentinel 等价性测试前一律禁用，所有实际
+  候选按 R2 干净重启执行，不能把“计划中的接口”当作已有功能。
+- P0：自动清理前必须锁定并核对 PID 的 `/proc` starttime、cmdline、cwd、环境
+  hash、进程组和端口 inode；同时核对 GPU UUID 与 CUDA_VISIBLE_DEVICES。身份
+  不匹配时只触发 `ABORT_REVIEW`，绝不发送 TERM/KILL。
+- P1：两次样本和 3% 差异不能形成可靠结论。性能门槛改为配对 seed 的至少三次
+  计时样本；近门槛候选用 bootstrap 95% CI，CI 跨越淘汰线时自动标记
+  `inconclusive`，最多重测一次。
+- P1：1K/32K 代理不能证明 128K MLA/KV 行为。涉及 PP、prefill、KV、page 或
+  调度的候选，L4 后最多保留两个，必须增加 `6×128K→16/32` 短探针；只有短探针
+  通过才允许进入昂贵的 128K→512 正式测试。
 
 ### 0.1 runner 的安全状态机
 
@@ -86,21 +105,26 @@ PRECHECK → SNAPSHOT → START_CANDIDATE → HEALTHY
 
 ### 2.2 统一晋级门槛
 
-所有性能比较先完成一次不计时 warmup。L3 采用三次结果的中位数，避免一次 JIT 或系统抖动改变结论。
+所有性能比较先完成一次不计时 warmup。L3/L4 至少使用三个配对 seed 的计时样本；
+明显远离门槛时可在三次后结束，接近门槛时用 bootstrap 95% CI 决定是否需要一次
+额外复测。L5 正式结果至少三个独立冷测；两次结果只可标为 `functional-only`，
+不得写成性能通过。
 
 **正确性硬门槛：**
 
 - 所有请求完成，completion token 数符合要求；无 HTTP 失败、engine dead、OOM、NaN、非法访存或 worker 重启。
 - 不改变数值路径的调度、缓存和通信改动，在 temperature=0 时必须和对应基线做 token 级输出比较。TP 归约顺序、KV dtype 等会合理改变浮点舍入的候选，若 token 不同则继续做中间 tensor 容差、needle/任务正确性和至少 64-token 的逐步对照；不能仅凭文本看起来合理就通过。
 - 多模态相关改动必须通过固定图片 OCR smoke。
+- 所有标为 cold 的测试，服务端 prefix-cache hit delta 必须为 0；命中非零时该
+  样本作废，由 runner 自动更换 seed 重跑一次，不能把热 cache 结果纳入比较。
 - 不得出现 Waiting/Deferred/抢占，除非该实验专门测试接纳上限；出现时不得把错峰吞吐当作同步吞吐。
 
 **速度候选晋级门槛：**
 
 - L1 局部 kernel 至少快 10%，且按 Amdahl 估算端到端潜在收益至少 2%；或该改动消除已确认的同步/CPU 阻塞。
-- L3 聚合 decode 中位数提高至少 5%，最低单路不得下降超过 3%。
+- L3 聚合 decode 中位数提高至少 5%，且配对 bootstrap 95% CI 下界仍高于 3%；最低单路不得下降超过 3%。
 - L4 `32K` 聚合 decode 至少提高 3%，TTFT 不得下降超过 3%，KV 容量不得下降超过 5%。
-- L5 两次独立冷测的聚合 decode 中位数至少提高 3%，每路中位和最低值均不得回退；TTFT、E2E、Waiting 和 KV 同时单独报告。
+- L5 三次独立冷测的聚合 decode 中位数至少提高 3%，bootstrap 95% CI 下界高于 0%，每路中位和最低值均不得回退；TTFT、E2E、Waiting 和 KV 同时单独报告。
 
 **容量候选晋级门槛：**
 
@@ -112,9 +136,9 @@ PRECHECK → SNAPSHOT → START_CANDIDATE → HEALTHY
 
 ### 2.3 自适应重复次数和按机制选 workload
 
-不再对每个候选机械地跑相同次数：
+不再对每个候选机械地跑相同次数，但任何性能结论至少有三个配对样本：
 
-- L3 先跑两次。若候选相对基线差异大于 8%、两次离散小于 2%，直接晋级或淘汰；只有接近门槛或离散较大时才跑第三次。
+- L3 先跑三次。若三次相对基线差异大于 8% 且 bootstrap CI 不跨 5% 门槛，可直接晋级或淘汰；接近门槛时只允许自动追加一次。
 - decode-only 候选不重复跑两个短 prefill workload：L3 后直接跑 `6×32K→512`。
 - prefill/KV 候选不浪费长输出：跑 `6×8K/32K→64`，只有晋级才补 512 输出。
 - prefix-cache 候选使用冷/热配对，不纳入独立冷请求速度排名。
@@ -141,10 +165,13 @@ PRECHECK → SNAPSHOT → START_CANDIDATE → HEALTHY
 | 类别 | 例子 | 执行方式 |
 |---|---|---|
 | R0 请求级 | prompt 长度、并发、prose/code、prefix 冷/热 | 同一服务连续运行 |
-| R1 idle 时可切换 | benchmark-only 的 k policy、MBT 上限内配额、kernel dispatch、计时开关 | 通过仅监听本机 Unix socket 的 allowlist 控制面切换；每次切换前确认 Running=Waiting=0 |
+| R1（当前禁用） | 计划中的 k policy、MBT 配额、kernel dispatch、计时开关 | 仓库尚无实现；不得在本轮使用。只有实现受控 Unix socket、sentinel 等价性测试和回滚后，下一轮才可启用 |
 | R2 必须重启 | PP/TP、PP 分层、KV dtype/page、CUDA Graph 内存形状、权重布局 | 一个配置只加载一次，加载后连续跑完其全部 L2–L4 |
 
-R1 控制面只存在于实验分支，不开放 TCP，不允许修改模型路径、GPU、端口、显存比例或任意环境变量。先对一个 sentinel 候选比较“运行时切换”和“干净重启”；差异超过 2% 就禁用 R1，全部回到 R2。正式 128K 验收始终使用干净重启的单一冠军配置，避免状态污染。
+本轮全部按 R0/R2 执行。未来若实现 R1，控制面只存在于实验分支，不开放 TCP，
+不允许修改模型路径、GPU、端口、显存比例或任意环境变量；先对一个 sentinel 候选
+比较运行时切换和干净重启，差异超过 2% 就禁用 R1。正式 128K 验收始终使用干净
+重启的单一冠军配置，避免状态污染。
 
 源码 kernel 候选可在同一实验二进制中保留 baseline/candidate 两条 allowlist dispatch 路径，先在一次加载中筛选；只有胜出实现才 cherry-pick 到干净 release-candidate 分支并正式重启。这是测试工具，不改变最终部署路径。
 
@@ -167,7 +194,7 @@ manifest 的 SHA256 写入所有结果。批次开始后不允许 Codex边看结
 | B3 | selector/top-k/rejection/采样融合 | 组件数值对照 + CUDA event，典型 rows=6/12/18 | L3，两类文本；再做 L4 | kernel <10% 或端到端预测 <2%，不集成 |
 | B4 | CUDA Graph/JIT warmup | 收集真实 specialization key；检查计时区间内无新 JIT 日志 | 冷、热各一次 L3，报告 p50/p95 | 只增加 graph 显存却不降冷抖动，回退 |
 | B5 | partial prefix + Mamba state | 2061/8704-token token级正确性回归；命中量必须与 state boundary 一致 | 8K/32K 同前缀冷/热对照；最终 128K 同前缀 | 任何输出不一致或错误命中，立即失败 |
-| B6 | prefill/MLA/indexer kernel | event 微基准覆盖 8K/32K chunk shape | `6×8K/32K→64`，只测 TTFT slope | 32K TTFT改善 <3%，不跑 128K |
+| B6 | prefill/MLA/indexer kernel | event 微基准覆盖 8K/32K chunk shape | `6×8K/32K→64`；晋级候选再做 `6×128K→16/32` 短探针 | 32K TTFT改善 <3% 或 128K 短探针异常，不跑 128K→512 |
 | B7 | CPU/EngineCore | eBPF/py-spy 或 wall timer，只读定位 scheduler、tokenizer、copy 占比 | L3 同时采集单核占用、PP event 空洞 | 未定位 ≥5% wall 热点，不进行盲目并行化 |
 | B8 | 混合 KV dtype/page | 单层数值误差、backend 能力检查、每 group 字节账本 | `1×8K` needle + `6×32K→128` | backend fallback、正确性失败或速度回退 >3% |
 | B9 | SM80 EXL3/INT4 fused kernel | 真实层/真实 rows 的 kernel microbench，覆盖 routed/non-routed | L3/L4 | 局部 <10% 或 Amdahl 预测 <2% |
@@ -335,5 +362,20 @@ main（已验证）
 ## 9. 批准后实际开始点
 
 批准本计划后，先执行 Batch 0，只增加 benchmark/runner、计时开关和实验分支，不改变正式算法。runner 的定向单测、dry-run 和一次故障恢复演练通过后，自动开始 Batch 1–3 配置 campaign；中间不需要 Codex 或用户逐项确认。若代理结果本身波动超过 5%，runner 自动复测一次，仍不稳定则恢复正式服务并生成 `ABORT_REVIEW`。
+
+当前实现的最小入口为：
+
+```bash
+# 只校验 manifest，不触碰正在运行的 30002
+/mnt/nvme0/keys-vllm-glm53/.venv/bin/python scripts/fast_opt_runner.py \
+  --manifest runtime/fast-opt-batch1.json
+
+# 用户批准后才执行；runner 会先严格核对当前正式 PID，再开始批次
+/mnt/nvme0/keys-vllm-glm53/.venv/bin/python scripts/fast_opt_runner.py \
+  --manifest runtime/fast-opt-batch1.json --execute
+```
+
+`runtime/fast-opt-batch1.json` 目前只包含已支持的 PP4 分层候选；PP2×TP2、TP4、
+static direct-recv 和源码 kernel 方向在各自 L0/L1 实现完成前不会伪装成可执行候选。
 
 第一次阶段汇报节点改为 Batch 1–3 整批结束：届时一次性提交基线校准、PP 分层、PP2×TP2/PP1×TP4、MBT、接纳容量的 ledger/L3/L4 结果、自动淘汰原因和当前冠军。Batch 4 每个已实现源码功能同样按“一次启动、一次结果”执行，不在测试中间等待智能体。未经批准，当前 30002 服务保持不变。

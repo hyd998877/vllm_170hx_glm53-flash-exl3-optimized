@@ -5,14 +5,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
 MODEL="${MODEL:?set MODEL to the GLM-5.3-Flash EXL3 checkpoint directory}"
 DFLASH_MODEL="${DFLASH_MODEL:?set DFLASH_MODEL to the DFlash2 checkpoint directory}"
+DFLASH_K="${DFLASH_K:-2}"
 MARLIN_DIR="${MARLIN_DIR:?set MARLIN_DIR to the converted Marlin sidecar directory}"
 PROFILE="${PROFILE:-multimodal}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30002}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-4}"
 SERVED_MODEL="${SERVED_MODEL:-GLM-5.3-Flash-tr3-4bpw}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-$ROOT/chat_templates/glm53-enable-thinking-switch.jinja}"
 TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
 EXL3_EXTENSION_DIR="${EXL3_EXTENSION_DIR:-$TORCH_EXTENSIONS_DIR/exllamav3_ext}"
+CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-3,6,9,12,15,18}"
 EXTRA_ARGS=()
 
 case "$PROFILE" in
@@ -67,8 +71,8 @@ export VLLM_PP_DECODE_PHASE_POLICY="${PP_DECODE_PHASE_POLICY:-pairpack}"
 export VLLM_PP_FIXED_DECODE_COMM="${PP_FIXED_DECODE_COMM:-0}"
 export VLLM_PP_DIRECT_RECV_BUFFER="${PP_DIRECT_RECV_BUFFER:-0}"
 export VLLM_PP_PREFILL_COHORT_BARRIER="$COHORT_BARRIER"
-export VLLM_PP_PREFILL_COHORT_SIZE="$([[ "$COHORT_BARRIER" == 1 ]] && echo 6 || echo 0)"
-export VLLM_PP_PREFILL_COHORT_MIN_TOKENS="$([[ "$COHORT_BARRIER" == 1 ]] && echo 65536 || echo 0)"
+export VLLM_PP_PREFILL_COHORT_SIZE="${COHORT_SIZE:-$([[ "$COHORT_BARRIER" == 1 ]] && echo 6 || echo 0)}"
+export VLLM_PP_PREFILL_COHORT_MIN_TOKENS="${COHORT_MIN_TOKENS:-$([[ "$COHORT_BARRIER" == 1 ]] && echo 65536 || echo 0)}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_USE_V2_MODEL_RUNNER=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -77,8 +81,8 @@ exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --served-model-name "$SERVED_MODEL" \
   --host "$HOST" \
   --port "$PORT" \
-  --tensor-parallel-size 1 \
-  --pipeline-parallel-size 4 \
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+  --pipeline-parallel-size "$PIPELINE_PARALLEL_SIZE" \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-1024}" \
@@ -97,7 +101,7 @@ exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --async-scheduling \
   --jit-monitor-mode warn \
   --compilation-config \
-    '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,9,12,15,18]}' \
+    "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[$CUDAGRAPH_CAPTURE_SIZES]}" \
   --speculative-config \
-    "{\"method\":\"dflash\",\"model\":\"$DFLASH_MODEL\",\"num_speculative_tokens\":2,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"auto\"}" \
+    "{\"method\":\"dflash\",\"model\":\"$DFLASH_MODEL\",\"num_speculative_tokens\":$DFLASH_K,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"auto\"}" \
   "${EXTRA_ARGS[@]}"
