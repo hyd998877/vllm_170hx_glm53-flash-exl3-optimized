@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import statistics
 import time
 import urllib.request
@@ -208,7 +209,15 @@ def main() -> None:
         result.pop("first_at", None)
         result.pop("last_at", None)
     total_completion = sum(r["completion_tokens"] or 0 for r in results)
-    steady_window = max(last_times) - max(first_times)
+    if len(first_times) != args.concurrency or len(last_times) != args.concurrency:
+        raise RuntimeError("not every stream produced a measurable token window")
+    # A common decode window must include the earliest first token and latest
+    # final token.  Using max(first_times) incorrectly credits tokens produced
+    # before the last stream entered the window and can inflate throughput.
+    steady_window = max(last_times) - min(first_times)
+    if steady_window <= 0:
+        raise RuntimeError("invalid aggregate decode window")
+    ttft_spread = max(first_times) - min(first_times)
     output = {
         "concurrency": args.concurrency,
         "requested_prompt_tokens_each": args.prompt_tokens,
@@ -219,15 +228,37 @@ def main() -> None:
         "all_distinct_from_first_user_token": True,
         "wall_s": wall,
         "aggregate_end_to_end_tps": total_completion / wall,
+        "median_ttft_s": statistics.median(r["ttft_s"] for r in results),
+        "max_ttft_s": max(r["ttft_s"] for r in results),
         "aggregate_decode_tps_from_last_ttft": (
             sum(max(0, (r["completion_tokens"] or 0) - 1) for r in results)
             / steady_window
         ),
+        "decode_window_s": steady_window,
+        "ttft_spread_s": ttft_spread,
         "mean_per_stream_decode_tps": statistics.mean(decode_rates),
         "median_per_stream_decode_tps": statistics.median(decode_rates),
         "min_per_stream_decode_tps": min(decode_rates),
         "results": sorted(results, key=lambda r: r["i"]),
     }
+    if not all(
+        math.isfinite(float(result[key]))
+        for result in results
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "ttft_s",
+            "decode_s",
+            "decode_tps",
+        )
+    ):
+        raise RuntimeError("benchmark produced non-finite or incomplete stream metrics")
+    if any(
+        result["prompt_tokens"] != args.prompt_tokens
+        or result["completion_tokens"] != args.max_tokens
+        for result in results
+    ):
+        raise RuntimeError("benchmark token counts differ from requested counts")
     encoded = json.dumps(output, ensure_ascii=False, indent=2)
     print(encoded, flush=True)
     if args.out:

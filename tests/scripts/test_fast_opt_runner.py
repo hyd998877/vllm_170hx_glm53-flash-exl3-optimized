@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import signal
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 RUNNER_PATH = Path(__file__).parents[2] / "scripts" / "fast_opt_runner.py"
 SPEC = importlib.util.spec_from_file_location("fast_opt_runner", RUNNER_PATH)
@@ -35,3 +40,141 @@ def test_candidate_env_preserves_process_environment(monkeypatch) -> None:
     assert env["RUNNER_SENTINEL"] == "present"
     assert env["BASE"] == "1"
     assert env["CANDIDATE"] == "2"
+
+
+def manifest_file(tmp_path: Path) -> Path:
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(tmp_path / "run"),
+                "max_campaign_s": 60,
+                "base_env": {
+                    "HOST": "127.0.0.1",
+                    "PYTHON_BIN": sys.executable,
+                    "MODEL": "/tmp/model",
+                },
+                "formal": {
+                    "port": 30002,
+                    "gpus": [0, 1, 2, 3],
+                    "env": {"HOST": "0.0.0.0"},
+                    "expected": {
+                        "served_model": "model",
+                        "model": "model",
+                        "cwd": "/tmp",
+                        "cuda_visible_devices": "0,1,2,3",
+                    },
+                },
+                "baseline": {"id": "baseline", "env": {}, "tests": []},
+                "candidates": [{"id": "candidate", "env": {}, "tests": []}],
+            }
+        )
+    )
+    return path
+
+
+def identity(pid: int = 123, pgid: int = 123) -> runner.ProcIdentity:
+    return runner.ProcIdentity(pid, "1", "cmd", "/tmp", "env", pgid)
+
+
+def test_runner_lock_is_singleton(tmp_path: Path) -> None:
+    manifest = manifest_file(tmp_path)
+    first = runner.Campaign(manifest, execute=False)
+    second = runner.Campaign(manifest, execute=False)
+    first.acquire_lock()
+    with pytest.raises(runner.AbortReview, match="another optimization runner"):
+        second.acquire_lock()
+
+
+def test_startup_failure_restores_formal(tmp_path: Path, monkeypatch) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=True)
+    restored = []
+    monkeypatch.setattr(campaign, "verify_formal", lambda: identity())
+    monkeypatch.setattr(campaign, "stop_formal", lambda: None)
+    monkeypatch.setattr(
+        campaign,
+        "start_candidate",
+        lambda _candidate: (_ for _ in ()).throw(OSError("boom")),
+    )
+    monkeypatch.setattr(campaign, "restore_formal", lambda: restored.append(True))
+    monkeypatch.setattr(runner, "port_bindings", lambda _port: [])
+    monkeypatch.setattr(runner, "port_pid", lambda _port: None)
+    assert campaign.run() == 2
+    assert restored == [True]
+
+
+def test_benchmark_timeout_terminates_client_group(tmp_path: Path, monkeypatch) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=False)
+    killed = []
+
+    class Process:
+        pid = 456
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(
+        runner,
+        "metrics_snapshot",
+        lambda _base: {
+            "prefix_queries": 0.0,
+            "prefix_hits": 0.0,
+            "running": 0.0,
+            "waiting": 0.0,
+            "deferred": 0.0,
+        },
+    )
+    test = {
+        "name": "timeout.json",
+        "concurrency": 1,
+        "prompt_tokens": 1,
+        "max_tokens": 1,
+        "timeout_s": -1,
+    }
+    with pytest.raises(subprocess.TimeoutExpired):
+        campaign.run_bench(tmp_path, test)
+    assert killed == [(456, signal.SIGTERM)]
+
+
+def test_sigterm_enters_recovery_exception() -> None:
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        runner.install_signal_handlers()
+        with pytest.raises(runner.RunnerSignal, match="signal"):
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_residual_worker_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=False)
+
+    class Exited:
+        def poll(self):
+            return 1
+
+    campaign.child = Exited()
+    campaign.child_identity = identity()
+    monkeypatch.setattr(campaign, "group_has_members", lambda _pgid: True)
+    with pytest.raises(runner.AbortReview, match="process group remains"):
+        campaign.stop_child()
+
+
+def test_candidate_port_conflict_aborts(tmp_path: Path, monkeypatch) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=False)
+
+    class Process:
+        pid = 123
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(runner, "read_proc_identity", lambda _pid: identity())
+    monkeypatch.setattr(runner, "port_pid", lambda _port: 999)
+    with pytest.raises(runner.AbortReview, match="already occupied"):
+        campaign.start_candidate({"id": "candidate", "env": {}})

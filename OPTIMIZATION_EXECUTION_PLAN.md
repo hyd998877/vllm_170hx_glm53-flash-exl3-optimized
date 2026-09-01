@@ -1,6 +1,6 @@
 # GLM-5.3 并发与速度优化：快速验证执行方案
 
-状态：**等待批准，尚未执行**  
+状态：**资深复核初审 REJECT；P0 修复中，二次批准前不执行**
 计划基线：commit `5bd3f5f8`，GPU 0–3，端口 30002  
 适用硬件：4× CMP 170HX / SM80；不修改 GPU 功耗、时钟或硬件拓扑
 
@@ -33,12 +33,22 @@ HTTP 超时、Waiting/Deferred、JIT 警告和候选性能回退均按预设规�
 - P0：仓库当前没有 R1 Unix-socket 控制面；`k`、MBT、CUDA Graph 形状等也并非
   通用热切换参数。R1 在实现并通过 sentinel 等价性测试前一律禁用，所有实际
   候选按 R2 干净重启执行，不能把“计划中的接口”当作已有功能。
-- P0：自动清理前必须锁定并核对 PID 的 `/proc` starttime、cmdline、cwd、环境
-  hash、进程组和端口 inode；同时核对 GPU UUID 与 CUDA_VISIBLE_DEVICES。身份
-  不匹配时只触发 `ABORT_REVIEW`，绝不发送 TERM/KILL。
+- P0：自动清理前必须拿 runner 独占锁，并使用全新 output_dir；核对 PID 的 `/proc`
+  starttime、cmdline、cwd、环境 allowlist、进程组、实际监听地址和 GPU UUID/PID。
+  身份不匹配时只触发 `ABORT_REVIEW`，绝不发送 TERM/KILL。GPU4–7 的 PID 快照
+  在整批期间必须不变。
+- P0：正式服务停止前要求 running/waiting/deferred 连续 5 秒为 0；候选父进程
+  用 `wait()` reap 后再检查进程组，残留 worker 直接中止且禁止恢复冲突服务。
+- P0：runner 由独立 `fast_opt_watchdog.py` 启动和监护；runner 的普通异常、
+  SIGTERM/SIGHUP 都进入恢复路径，未知 listener、残留 worker 或 GPU 状态变化
+  时 watchdog 只写 `ABORT_REVIEW`，不猜测性杀进程。
 - P1：两次样本和 3% 差异不能形成可靠结论。性能门槛改为配对 seed 的至少三次
   计时样本；近门槛候选用 bootstrap 95% CI，CI 跨越淘汰线时自动标记
   `inconclusive`，最多重测一次。
+- P0：decode 聚合使用 `max(last)-min(first)` 的共同时间窗，避免按最后一路 TTFT
+  截断造成虚高；运行期间每秒采样并记录 Waiting/Deferred 峰值。
+- P0：L3 只是速度/容量初筛；L4 的 32K 与 128K 短探针必须有同口径 paired baseline，
+  同时比较 TTFT、decode、排队峰值和 KV tokens 后才算 promoted。
 - P1：1K/32K 代理不能证明 128K MLA/KV 行为。涉及 PP、prefill、KV、page 或
   调度的候选，L4 后最多保留两个，必须增加 `6×128K→16/32` 短探针；只有短探针
   通过才允许进入昂贵的 128K→512 正式测试。
@@ -92,9 +102,9 @@ PRECHECK → SNAPSHOT → START_CANDIDATE → HEALTHY
 | L2 服务 smoke | `1×1K→16`，文本；涉及视觉时再做一次 OCR | <1 min | 验证启动、API、正确性和无崩溃 |
 | L3 decode 筛选 | `6×1K→512`，预热 1 次、计时 3 次 | 1–2 min | 快速判断 decode、PP 和 CPU 控制路径 |
 | L4 上下文趋势 | `6×8K→64` + `6×32K→64`；晋级者再跑 `6×32K→512` | 2–5 min | 检查 prefill、KV、长上下文 attention 趋势 |
-| L5 正式验收 | `6×128K→512` 两次冷且 prompt seed 不同；最终冠军再跑 `→8192` | 每候选 12–30 min | 形成可发布结论 |
+| L5 正式验收 | `6×128K→512` 至少三次冷且 prompt seed 不同；最终冠军再跑 `→8192` | 每候选 18–40 min | 形成可发布结论 |
 
-这里的“冷且 seed 不同”指两次请求从首个用户 token 起都不同，禁止第二次复用第一次的 prefix cache。测试工具执行前增加 `--stream-offset`/`--prompt-seed`，并在结果中记录服务端 prefix-cache hit delta；否则热 cache 会污染 TTFT。
+这里的“冷且 seed 不同”指每次请求从首个用户 token 起都不同，禁止后续测试复用之前的 prefix cache。测试工具使用 `--prompt-seed`，并在结果中记录服务端 prefix-cache hit delta；否则热 cache 会污染 TTFT。
 
 ### 2.1 为什么代理测试合理
 
@@ -258,7 +268,7 @@ Codex 只负责实现代码和在运行前把候选加入 manifest。测试启�
 ### Batch 5：胜出组合和正式验收
 
 - 只合并机制兼容且单项已晋级的候选，形成一个 release candidate。
-- 跑两次不同 prompt seed 的 `6×128K→512`。
+- 跑至少三次不同 prompt seed 的 `6×128K→512`。
 - 达标后跑 prose、code 各一次 `6×128K→512`。
 - 最终冠军才跑一次 `6×128K→8192`；如果与固定 k=2 差异在噪声内，不再重复。
 - 多模态 OCR、512K needle、API smoke 和故障恢复测试作为发布正确性验收。
@@ -323,7 +333,7 @@ runner 对每个候选执行：
 6. 写入 `promoted/rejected/inconclusive`，只有 `promoted` 才进入下一层。
 7. 实验结束恢复已验证正式参数，并复核文本、视觉和 `/health`。
 
-runner 作为独立本地进程运行，不依附 Codex 的 shell/PTY 生命周期。Codex 启动后即可退出当前交互，不做高频轮询；需要查看状态时只读取一次 `STATUS.json`。runner 每 10 秒原子更新心跳，单个请求和单次启动都有硬超时，主机重启或 runner 异常退出后可根据 manifest 和 PID 快照幂等恢复。
+runner 由独立 watchdog 进程启动，不依附 Codex 的 shell/PTY 生命周期。Codex 启动后即可退出当前交互，不做高频轮询；需要查看状态时只读取一次 `STATUS.json`。runner 每 10 秒原子更新心跳，单个请求和单次启动都有硬超时。watchdog 只在端口空闲、GPU0–3 无残留且 GPU4–7 快照未变化时恢复正式服务；未知状态 fail-closed，禁止把“猜测性恢复”描述成幂等恢复。
 
 确定性自动判定包括：
 
@@ -370,8 +380,8 @@ main（已验证）
 /mnt/nvme0/keys-vllm-glm53/.venv/bin/python scripts/fast_opt_runner.py \
   --manifest runtime/fast-opt-batch1.json
 
-# 用户批准后才执行；runner 会先严格核对当前正式 PID，再开始批次
-/mnt/nvme0/keys-vllm-glm53/.venv/bin/python scripts/fast_opt_runner.py \
+# 资深二次批准后才执行；watchdog 监护 runner 和正式恢复
+/mnt/nvme0/keys-vllm-glm53/.venv/bin/python scripts/fast_opt_watchdog.py \
   --manifest runtime/fast-opt-batch1.json --execute
 ```
 

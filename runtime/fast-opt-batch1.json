@@ -1,12 +1,14 @@
 {
   "name": "fast-opt-batch1-pp4-partition",
-  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260901/batch1",
+  "max_campaign_s": 21600,
+  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260901/batch1-rerun",
   "base_env": {
     "PYTHON_BIN": "/mnt/nvme0/keys-vllm-glm53/.venv/bin/python",
     "MODEL": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
     "DFLASH_MODEL": "/mnt/nvme0/models/GLM-5.3-Flash-DFlash2",
     "MARLIN_DIR": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw-marlin-int4-gs64",
     "PROFILE": "multimodal",
+    "HOST": "127.0.0.1",
     "PORT": "30002",
     "SERVED_MODEL": "GLM-5.3-Flash-tr3-4bpw",
     "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -24,42 +26,54 @@
   },
   "formal": {
     "port": 30002,
+    "host": "0.0.0.0",
+    "isolation_required": false,
     "gpus": [0, 1, 2, 3],
     "env": {
-      "PP_PARTITION": "13,12,11,9"
+      "PP_PARTITION": "13,12,11,9",
+      "HOST": "0.0.0.0"
     },
     "expected": {
       "model": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
       "served_model": "GLM-5.3-Flash-tr3-4bpw",
       "cwd": "/mnt/nvme0/keys-vllm-glm53/vllm-glm53-pr",
-      "cuda_visible_devices": "0,1,2,3"
+      "cuda_visible_devices": "0,1,2,3",
+      "cmdline_sha256": "8a6be0528ef0b553722a4495b0063c92e86e0a430e1f94ed418c683a2d236b9e",
+      "serve_script_sha256": "c3a0e0a4c8c7666809834896b18bb60494461170d20bba24896df820e12fb7c8",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "VLLM_PP_LAYER_PARTITION": "13,12,11,9",
+        "VLLM_PP_PREFILL_COHORT_BARRIER": "0",
+        "VLLM_PP_DECODE_PHASE_POLICY": "pairpack",
+        "VLLM_PP_FIXED_DECODE_COMM": "0",
+        "VLLM_PP_DIRECT_RECV_BUFFER": "0",
+        "VLLM_EXL3_MARLIN_LAYERS": "3-44",
+        "VLLM_EXL3_NON_ROUTED_FP8": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"
+      }
     }
   },
   "baseline": {
-    "l3": [
-      {
-        "aggregate_decode_tps_from_last_ttft": 216.92340835741348,
-        "median_per_stream_decode_tps": 36.910176303039464,
-        "min_per_stream_decode_tps": 34.85414145756279
-      },
-      {
-        "aggregate_decode_tps_from_last_ttft": 213.89023151602063,
-        "median_per_stream_decode_tps": 36.212834244897444,
-        "min_per_stream_decode_tps": 34.10391034907454
-      },
-      {
-        "aggregate_decode_tps_from_last_ttft": 217.2776542361685,
-        "median_per_stream_decode_tps": 36.125834140828744,
-        "min_per_stream_decode_tps": 34.32259378747753
-      }
-    ],
-    "min_per_stream_decode_tps": 34.10391034907454
+    "id": "baseline-p1312119",
+    "vision_smoke": true,
+    "env": {"PP_PARTITION": "13,12,11,9"},
+    "tests": [
+      {"name": "warmup-1k-16.json", "concurrency": 1, "prompt_tokens": 1024, "max_tokens": 16, "prompt_seed": 6999, "cold": false},
+      {"name": "l3-7004.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7004},
+      {"name": "l3-7005.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7005},
+      {"name": "l3-7006.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7006},
+      {"name": "l4-32k-64.json", "concurrency": 6, "prompt_tokens": 32768, "max_tokens": 64, "prompt_seed": 7104},
+      {"name": "l4-128k-16.json", "concurrency": 6, "prompt_tokens": 131072, "max_tokens": 16, "prompt_seed": 7204}
+    ]
   },
   "candidates": [
     {
       "id": "a1-p13111110",
+      "vision_smoke": true,
       "env": {"PP_PARTITION": "13,11,11,10"},
       "tests": [
+        {"name": "warmup-1k-16.json", "concurrency": 1, "prompt_tokens": 1024, "max_tokens": 16, "prompt_seed": 6999, "cold": false},
         {"name": "l3-7004.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7004},
         {"name": "l3-7005.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7005},
         {"name": "l3-7006.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7006},
@@ -69,8 +83,10 @@
     },
     {
       "id": "a1-p12111111",
+      "vision_smoke": true,
       "env": {"PP_PARTITION": "12,11,11,11"},
       "tests": [
+        {"name": "warmup-1k-16.json", "concurrency": 1, "prompt_tokens": 1024, "max_tokens": 16, "prompt_seed": 6999, "cold": false},
         {"name": "l3-7004.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7004},
         {"name": "l3-7005.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7005},
         {"name": "l3-7006.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7006},
@@ -80,8 +96,10 @@
     },
     {
       "id": "a1-p12121010",
+      "vision_smoke": true,
       "env": {"PP_PARTITION": "12,12,10,11"},
       "tests": [
+        {"name": "warmup-1k-16.json", "concurrency": 1, "prompt_tokens": 1024, "max_tokens": 16, "prompt_seed": 6999, "cold": false},
         {"name": "l3-7004.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7004},
         {"name": "l3-7005.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7005},
         {"name": "l3-7006.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7006},
