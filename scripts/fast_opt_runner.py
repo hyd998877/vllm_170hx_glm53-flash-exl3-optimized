@@ -718,7 +718,17 @@ class Campaign:
                     if self.child is not None:
                         self.child_identity = read_proc_identity(self.child.pid)
                         self.verify_gpu_ownership(self.child_identity)
-                    self.event("candidate_healthy", candidate=candidate["id"])
+                    # ``wait_healthy`` is shared by optimization candidates
+                    # and the restored formal service.  The formal manifest
+                    # intentionally has no candidate ``id``; using an indexed
+                    # lookup here made a successful restore raise KeyError
+                    # after the API was already healthy and listening.
+                    if self.child_role == "formal":
+                        self.event("formal_healthy", pid=self.child.pid)
+                    else:
+                        self.event(
+                            "candidate_healthy", candidate=candidate["id"]
+                        )
                     return True
             time.sleep(2)
         return False

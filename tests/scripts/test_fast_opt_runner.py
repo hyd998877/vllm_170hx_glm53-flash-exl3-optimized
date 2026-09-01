@@ -178,3 +178,40 @@ def test_candidate_port_conflict_aborts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(runner, "port_pid", lambda _port: 999)
     with pytest.raises(runner.AbortReview, match="already occupied"):
         campaign.start_candidate({"id": "candidate", "env": {}})
+
+
+def test_formal_health_does_not_require_candidate_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=False)
+
+    class Process:
+        pid = 123
+
+        @staticmethod
+        def poll():
+            return None
+
+    campaign.child = Process()
+    campaign.child_role = "formal"
+    campaign.child_identity = identity()
+    events = []
+    monkeypatch.setattr(
+        runner,
+        "http_get",
+        lambda url, timeout: (
+            (200, "model") if url.endswith("/v1/models") else (200, "")
+        ),
+    )
+    monkeypatch.setattr(runner, "read_proc_identity", lambda _pid: identity())
+    monkeypatch.setattr(campaign, "verify_gpu_ownership", lambda *_args: None)
+    monkeypatch.setattr(
+        campaign,
+        "event",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    formal = campaign.manifest["formal"]
+    formal["isolation_required"] = False
+    assert campaign.wait_healthy(formal)
+    assert events == [("formal_healthy", {"pid": 123})]
