@@ -6,6 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
 MODEL="${MODEL:?set MODEL to the GLM-5.3-Flash EXL3 checkpoint directory}"
 DFLASH_MODEL="${DFLASH_MODEL:?set DFLASH_MODEL to the DFlash2 checkpoint directory}"
 DFLASH_K="${DFLASH_K:-2}"
+DFLASH_BATCH_SCHEDULE_JSON="${DFLASH_BATCH_SCHEDULE_JSON:-}"
 MARLIN_DIR="${MARLIN_DIR:?set MARLIN_DIR to the converted Marlin sidecar directory}"
 PROFILE="${PROFILE:-multimodal}"
 HOST="${HOST:-0.0.0.0}"
@@ -18,6 +19,11 @@ TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
 EXL3_EXTENSION_DIR="${EXL3_EXTENSION_DIR:-$TORCH_EXTENSIONS_DIR/exllamav3_ext}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-3,6,9,12,15,18}"
 EXTRA_ARGS=()
+DFLASH_BATCH_SCHEDULE_FIELD=""
+
+if [[ -n "$DFLASH_BATCH_SCHEDULE_JSON" ]]; then
+  DFLASH_BATCH_SCHEDULE_FIELD=",\"num_speculative_tokens_per_batch_size\":$DFLASH_BATCH_SCHEDULE_JSON"
+fi
 
 case "$PROFILE" in
   multimodal)
@@ -103,5 +109,5 @@ exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --compilation-config \
     "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[$CUDAGRAPH_CAPTURE_SIZES]}" \
   --speculative-config \
-    "{\"method\":\"dflash\",\"model\":\"$DFLASH_MODEL\",\"num_speculative_tokens\":$DFLASH_K,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"auto\"}" \
+    "{\"method\":\"dflash\",\"model\":\"$DFLASH_MODEL\",\"num_speculative_tokens\":$DFLASH_K,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"auto\"$DFLASH_BATCH_SCHEDULE_FIELD}" \
   "${EXTRA_ARGS[@]}"

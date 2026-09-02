@@ -757,6 +757,8 @@ class Campaign:
             "--out",
             str(output),
         ]
+        if test.get("workload") is not None:
+            command.extend(["--workload", str(test["workload"])])
         timeout = float(test.get("timeout_s", 7200))
         started = time.monotonic()
         completed = subprocess.Popen(

@@ -396,3 +396,69 @@ main（已验证）
 static direct-recv 和源码 kernel 方向在各自 L0/L1 实现完成前不会伪装成可执行候选。
 
 第一次阶段汇报节点改为 Batch 1–3 整批结束：届时一次性提交基线校准、PP 分层、PP2×TP2/PP1×TP4、MBT、接纳容量的 ledger/L3/L4 结果、自动淘汰原因和当前冠军。Batch 4 每个已实现源码功能同样按“一次启动、一次结果”执行，不在测试中间等待智能体。未经批准，当前 30002 服务保持不变。
+
+## 10. Batch 2–5 执行收尾（2026-09-02）
+
+本轮按上述门禁继续执行，目标服务始终限定为 GPU0–3、PP4/TP1、端口 30002；GPU4–7
+的 DeepSeek 进程未停止、未重启、未改变功耗或时钟。Batch 2–4 的候选均已完成
+静态或服务级判定，未通过门禁的开关保持关闭。
+
+### Batch 2：拓扑
+
+PP2×TP2 和 PP1×TP4 在 L0 被淘汰：当前 EXL3 MoE 实现要求 TP=1，且 GPU0–3
+之间只有 PCIe PIX、没有 NVLink。未发生服务重启，证据为
+`runtime/fast-opt-batch2-l0.json`。
+
+### Batch 3：调度
+
+MBT=768 完成三次配对 L3 和长上下文代理。聚合中位相对 MBT=1024 为
+`+1.084%`，bootstrap CI95 为 `[-0.933%, +1.972%]`，且首轮出现 Waiting=2，
+未达到速度或稳定性门槛；正式配置保持 MBT=1024。证据目录为
+`runtime/fast-opt-20260902/batch3-mbt768/`。
+
+### Batch 4：DFlash、PP hand-off 与 kernel 门禁
+
+- static direct-recv：定向单测通过，但两次服务 smoke 分别触发 graph buffer
+  重叠拷贝和 padded-row 形状不一致；服务级候选回退约 9%，未启用。
+- adaptive k：`DFLASH_BATCH_SCHEDULE_JSON` 已实现为 opt-in 配置并通过 6 项
+  fixed-PP worker 测试；`k=3 (batch 1–2) / k=2 (batch 3–6)` 的 L3 中位相对固定
+  k=2 为 `-2.920%`，CI95 `[-3.845%, -0.498%]`，未启用。
+- prefix/Mamba/kpool/runner 定向门禁：`122 passed, 1 skipped`；DFlash
+  selector/causality 逻辑门禁 `18 passed`。GPU-only prepare/rejection 长测因
+  GPU0–3 正式服务占用而不强行并行；已有服务级 A/B 已覆盖真实 GPU 路径。
+- kernel/selector 审计：selector walk、draft-logit cache 和 rejection 已各自
+  使用 Triton kernel；当前瓶颈候选仍包含 154880 词表的 FP32 sampling-param
+  materialization。CMP170HX 返回 `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`，没有
+  足够 event 占比证据，不合入未经证明的融合改动。已有 fused context-KV
+  projection 微基准在 6/18/256 token 分别为 `1.94x/1.56x/1.26x`，保留现路径。
+- JIT 复核：verbose specialization 证据显示剩余 kpool/FP8 MQA 首次编译并非
+  完全漏掉 kernel，而是 warmup dummy 只覆盖了部分指针对齐和标量
+  divisibility key。补齐对齐/未对齐及 token-count key 是合理的后续候选，但
+  需要独立 manifest、重启和冷/热延迟 A/B；本轮不把未经服务级验证的 warmup
+  扩张混入正式配置。
+
+### Batch 5：正式验收
+
+建立 `runtime/fast-opt-batch5.json`，采用当前正式服务的 in-place、no-restart
+验收，结果目录为
+`/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260902/batch5-formal-acceptance/`。
+为保证输入类型可复现，benchmark 新增 `--workload prose|code`，不改变服务算法。
+该 JSON 的 schema 明确为 `acceptance_result`，`runner_executable=false`；它是
+完成态结果清单，不是含 `baseline/candidates` 的可执行 campaign manifest。
+
+| 测试 | 结果 |
+|---|---:|
+| prose，3× `6×128K→512`，共同 decode 窗口聚合中位 | **165.75 tok/s** |
+| prose，3×每路 decode 中位 | **34.57 tok/s** |
+| code，`6×128K→512`，共同窗口聚合/每路中位 | **202.28 / 40.68 tok/s** |
+| prose，`6×128K→8192`，共同窗口聚合/每路中位 | **185.81 / 36.37 tok/s** |
+| 500K needle | **通过**，实际 500000 tokens，marker 精确命中 |
+| 多模态 OCR | **通过**，返回 `Hello, AI world!` |
+| API smoke / 512K max context | **通过**，`/v1/models` 报 max_model_len=524288，API 返回 `OK` |
+| Waiting/Deferred | 所有正式长测结束均为 0 |
+| 故障恢复 | Batch 4 watchdog recovery 已验证；Batch 5 复用同一 fail-closed 路径 |
+
+这里的 165.75/202.28/185.81 使用修正后的共同时间窗口（最早首 token 到最晚
+末 token）。历史 208.01/222.48 是旧的 last-TTFT 或热测口径，仍保留作历史记录，
+不能与本轮新口径直接比较；因此本轮没有虚构新的“冠军”。正式实例最终恢复并核验
+为 `0.0.0.0:30002`，命令行仍为 DFlash2 k=2、视觉路径、PP 分层 `13,12,11,9`。

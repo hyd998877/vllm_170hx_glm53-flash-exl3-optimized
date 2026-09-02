@@ -1,0 +1,78 @@
+{
+  "schema": "glm53.fast_opt.acceptance_result/v1",
+  "document_type": "acceptance_result_manifest",
+  "runner_executable": false,
+  "name": "fast-opt-batch5-formal-acceptance",
+  "batch": 5,
+  "status": "completed_in_place",
+  "execution_mode": "in_place_formal_no_restart",
+  "date": "2026-09-02",
+  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260902/batch5-formal-acceptance",
+  "formal": {
+    "host": "0.0.0.0",
+    "port": 30002,
+    "gpus": [0, 1, 2, 3],
+    "model": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
+    "served_model": "GLM-5.3-Flash-tr3-4bpw",
+    "pipeline_parallel_size": 4,
+    "tensor_parallel_size": 1,
+    "pp_partition": "13,12,11,9",
+    "max_model_len": 524288,
+    "max_num_seqs": 6,
+    "max_num_batched_tokens": 1024,
+    "gpu_memory_utilization": 0.96,
+    "dflash_model": "/mnt/nvme0/models/GLM-5.3-Flash-DFlash2",
+    "dflash_k": 2,
+    "vision_enabled": true,
+    "prefix_cache_enabled": true
+  },
+  "tests": [
+    {
+      "name": "c6-128k-512-prose",
+      "concurrency": 6,
+      "prompt_tokens": 131072,
+      "max_tokens": 512,
+      "seeds": [8501, 8502, 8503],
+      "artifacts": [
+        "c6-128k-512-r1.json",
+        "c6-128k-512-r2.json",
+        "c6-128k-512-r3.json"
+      ]
+    },
+    {
+      "name": "c6-128k-512-code",
+      "concurrency": 6,
+      "prompt_tokens": 131072,
+      "max_tokens": 512,
+      "seed": 8601,
+      "artifact": "c6-128k-512-code.json"
+    },
+    {
+      "name": "c6-128k-8192-prose",
+      "concurrency": 6,
+      "prompt_tokens": 131072,
+      "max_tokens": 8192,
+      "seed": 8701,
+      "artifact": "c6-128k-8192.json"
+    },
+    {
+      "name": "needle-500k",
+      "prompt_tokens": 500000,
+      "max_tokens": 32,
+      "artifact": "needle-500k.json"
+    },
+    {
+      "name": "multimodal-ocr",
+      "artifact": "ocr.json"
+    },
+    {
+      "name": "api-smoke",
+      "artifact": "api-smoke.json"
+    }
+  ],
+  "recovery": {
+    "status": "verified_shared_runner_path",
+    "evidence": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260902/batch4-adaptive-k",
+    "watchdog_dry_run": "WATCHDOG DRY-RUN OK"
+  }
+}

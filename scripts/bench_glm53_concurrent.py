@@ -39,9 +39,40 @@ FILLERS = (
     ),
 )
 
+CODE_FILLERS = (
+    (
+        "def validate_record(record_id: int, payload: bytes) -> bool:\n"
+        "    checksum = sum(payload) & 0xFFFF\n"
+        "    return record_id >= 0 and checksum != 0\n\n"
+    ),
+    (
+        "class RequestLedger:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.entries: dict[int, str] = {}\n\n"
+        "    def add(self, key: int, value: str) -> None:\n"
+        "        self.entries[key] = value\n\n"
+    ),
+    (
+        "async def fetch_segment(client, offset: int) -> bytes:\n"
+        "    response = await client.get(f'/segments/{offset}')\n"
+        "    response.raise_for_status()\n"
+        "    return response.content\n\n"
+    ),
+    (
+        "fn rotate_checksum(value: u64, shift: u32) -> u64 {\n"
+        "    value.rotate_left(shift % 64) ^ 0x9e3779b97f4a7c15\n"
+        "}\n\n"
+    ),
+)
+
 
 def make_prompt(
-    tokenizer, template: str, stream_id: int, target: int, seed: int = 0
+    tokenizer,
+    template: str,
+    stream_id: int,
+    target: int,
+    seed: int = 0,
+    workload: str = "prose",
 ) -> str:
     unique = (
         f"SEED-{seed}-STREAM-{stream_id}-UNIQUE-"
@@ -49,12 +80,20 @@ def make_prompt(
         f"This is independent workload number {stream_id}; its prefix must not be "
         "shared. "
     )
-    suffix = (
-        "\nAfter reading the document, write a detailed continuous technical "
-        "discussion "
-        "of reliable long-context inference. Continue until the output limit."
-    )
-    unit = FILLERS[stream_id % len(FILLERS)]
+    if workload == "code":
+        suffix = (
+            "\nReview this code corpus and produce a detailed implementation with "
+            "tests for a reliable concurrent inference request ledger. Continue "
+            "writing code and concise code comments until the output limit."
+        )
+        unit = CODE_FILLERS[stream_id % len(CODE_FILLERS)]
+    else:
+        suffix = (
+            "\nAfter reading the document, write a detailed continuous technical "
+            "discussion of reliable long-context inference. Continue until the "
+            "output limit."
+        )
+        unit = FILLERS[stream_id % len(FILLERS)]
 
     def count(text: str) -> int:
         encoded = tokenizer.apply_chat_template(
@@ -172,6 +211,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=1)
+    parser.add_argument("--workload", choices=("prose", "code"), default="prose")
     parser.add_argument(
         "--prompt-seed",
         type=int,
@@ -187,7 +227,14 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     template = Path(args.chat_template).read_text()
     prompts = [
-        make_prompt(tokenizer, template, i, args.prompt_tokens, args.prompt_seed)
+        make_prompt(
+            tokenizer,
+            template,
+            i,
+            args.prompt_tokens,
+            args.prompt_seed,
+            args.workload,
+        )
         for i in range(args.concurrency)
     ]
 
@@ -225,6 +272,7 @@ def main() -> None:
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "workload": args.workload,
         "all_distinct_from_first_user_token": True,
         "wall_s": wall,
         "aggregate_end_to_end_tps": total_completion / wall,
