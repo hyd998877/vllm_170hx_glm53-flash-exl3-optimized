@@ -921,6 +921,40 @@ class Campaign:
         atomic_json(candidate_dir / "baseline.json", baseline)
         return baseline
 
+    def load_reused_baseline(self, path: Path) -> dict[str, Any]:
+        """Load a previously measured baseline after formal identity checks.
+
+        Reusing a paired baseline is safe only when the manifest pins the
+        exact result file and ``verify_formal`` has already accepted the live
+        production process.  This avoids paying another multi-minute model
+        load for every R2 candidate while retaining an auditable source.
+        """
+        source = path.resolve()
+        if not source.is_file():
+            raise AbortReview(f"reused baseline does not exist: {source}")
+        try:
+            baseline = json.loads(source.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AbortReview(f"cannot read reused baseline: {source}") from exc
+        if not isinstance(baseline, dict):
+            raise AbortReview("reused baseline must be a JSON object")
+        if not isinstance(baseline.get("l3"), list) or len(baseline["l3"]) != 3:
+            raise AbortReview("reused baseline must contain exactly three L3 runs")
+        if not isinstance(baseline.get("kv_tokens"), int):
+            raise AbortReview("reused baseline is missing integer kv_tokens")
+        for item in baseline["l3"]:
+            parse_bench_result = item
+            if not isinstance(parse_bench_result, dict):
+                raise AbortReview("reused baseline has malformed L3 entry")
+            for key in (
+                "aggregate_decode_tps_from_last_ttft",
+                "min_per_stream_decode_tps",
+            ):
+                if key not in parse_bench_result:
+                    raise AbortReview(f"reused baseline L3 entry missing {key}")
+        self.event("baseline_reused", source=str(source))
+        return baseline
+
     def evaluate_tests(
         self,
         candidate: dict[str, Any],
@@ -1136,16 +1170,25 @@ class Campaign:
         self.verify_formal()
         formal_stopping = False
         try:
+            baseline_source = self.manifest.get("baseline_result")
+            reused_baseline = (
+                self.load_reused_baseline(Path(baseline_source))
+                if baseline_source
+                else None
+            )
             # Mark before sending SIGTERM: if termination partially succeeds,
             # the exception path must still attempt recovery.
             formal_stopping = True
             self.stop_formal()
-            baseline_spec = self.manifest["baseline"]
-            baseline_dir = self.start_candidate(baseline_spec)
-            if not self.wait_healthy(baseline_spec):
-                raise AbortReview("paired baseline service failed health check")
-            baseline = self.evaluate_baseline(baseline_spec, baseline_dir)
-            self.stop_child()
+            if reused_baseline is not None:
+                baseline = reused_baseline
+            else:
+                baseline_spec = self.manifest["baseline"]
+                baseline_dir = self.start_candidate(baseline_spec)
+                if not self.wait_healthy(baseline_spec):
+                    raise AbortReview("paired baseline service failed health check")
+                baseline = self.evaluate_baseline(baseline_spec, baseline_dir)
+                self.stop_child()
             decisions: list[dict[str, Any]] = []
             for candidate in self.manifest["candidates"]:
                 candidate_dir = self.start_candidate(candidate)

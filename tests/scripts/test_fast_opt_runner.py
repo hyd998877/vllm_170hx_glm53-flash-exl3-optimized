@@ -215,3 +215,33 @@ def test_formal_health_does_not_require_candidate_id(
     formal["isolation_required"] = False
     assert campaign.wait_healthy(formal)
     assert events == [("formal_healthy", {"pid": 123})]
+
+
+def test_reused_baseline_is_validated_and_loaded(tmp_path: Path) -> None:
+    campaign = runner.Campaign(manifest_file(tmp_path), execute=False)
+    source = tmp_path / "baseline.json"
+    source.write_text(
+        json.dumps(
+            {
+                "kv_tokens": 100,
+                "l3": [
+                    {
+                        "aggregate_decode_tps_from_last_ttft": 10,
+                        "min_per_stream_decode_tps": 1,
+                    }
+                ]
+                * 3,
+            }
+        )
+    )
+    events = []
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            campaign, "event", lambda kind, **fields: events.append(kind)
+        )
+        baseline = campaign.load_reused_baseline(source)
+    finally:
+        monkeypatch.undo()
+    assert baseline["kv_tokens"] == 100
+    assert events == ["baseline_reused"]

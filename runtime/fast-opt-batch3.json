@@ -1,0 +1,81 @@
+{
+  "name": "fast-opt-batch3-scheduler",
+  "max_campaign_s": 7200,
+  "output_dir": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260902/batch3-mbt768",
+  "baseline_result": "/mnt/nvme0/keys-vllm-glm53/runtime/fast-opt-20260901/batch1-exec-2350/baseline-p1312119/baseline.json",
+  "base_env": {
+    "PYTHON_BIN": "/mnt/nvme0/keys-vllm-glm53/.venv/bin/python",
+    "MODEL": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
+    "DFLASH_MODEL": "/mnt/nvme0/models/GLM-5.3-Flash-DFlash2",
+    "MARLIN_DIR": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw-marlin-int4-gs64",
+    "PROFILE": "multimodal",
+    "HOST": "127.0.0.1",
+    "PORT": "30002",
+    "SERVED_MODEL": "GLM-5.3-Flash-tr3-4bpw",
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "TORCH_EXTENSIONS_DIR": "/mnt/nvme0/models/.torch_extensions",
+    "EXL3_EXTENSION_DIR": "/mnt/nvme0/models/.torch_extensions/exllamav3_ext",
+    "MAX_MODEL_LEN": "524288",
+    "MAX_NUM_SEQS": "6",
+    "MAX_NUM_BATCHED_TOKENS": "1024",
+    "GPU_MEMORY_UTILIZATION": "0.96",
+    "DFLASH_K": "2",
+    "PP_DECODE_PHASE_POLICY": "pairpack",
+    "PP_FIXED_DECODE_COMM": "0",
+    "PP_DIRECT_RECV_BUFFER": "0",
+    "COHORT_BARRIER": "0"
+  },
+  "formal": {
+    "port": 30002,
+    "host": "0.0.0.0",
+    "isolation_required": false,
+    "gpus": [0, 1, 2, 3],
+    "env": {
+      "PP_PARTITION": "13,12,11,9",
+      "HOST": "0.0.0.0"
+    },
+    "expected": {
+      "model": "/mnt/nvme0/models/GLM-5.3-Flash-tr3-4bpw",
+      "served_model": "GLM-5.3-Flash-tr3-4bpw",
+      "cwd": "/mnt/nvme0/keys-vllm-glm53/vllm-glm53-pr",
+      "cuda_visible_devices": "0,1,2,3",
+      "cmdline_sha256": "8a6be0528ef0b553722a4495b0063c92e86e0a430e1f94ed418c683a2d236b9e",
+      "serve_script_sha256": "c3a0e0a4c8c7666809834896b18bb60494461170d20bba24896df820e12fb7c8",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "VLLM_PP_LAYER_PARTITION": "13,12,11,9",
+        "VLLM_PP_PREFILL_COHORT_BARRIER": "0",
+        "VLLM_PP_DECODE_PHASE_POLICY": "pairpack",
+        "VLLM_PP_FIXED_DECODE_COMM": "0",
+        "VLLM_PP_DIRECT_RECV_BUFFER": "0",
+        "VLLM_EXL3_MARLIN_LAYERS": "3-44",
+        "VLLM_EXL3_NON_ROUTED_FP8": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"
+      }
+    }
+  },
+  "baseline": {
+    "id": "unused-reused-baseline",
+    "env": {},
+    "tests": []
+  },
+  "candidates": [
+    {
+      "id": "a3-mbt768",
+      "vision_smoke": true,
+      "env": {
+        "PP_PARTITION": "13,12,11,9",
+        "MAX_NUM_BATCHED_TOKENS": "768"
+      },
+      "tests": [
+        {"name": "warmup-1k-16.json", "concurrency": 1, "prompt_tokens": 1024, "max_tokens": 16, "prompt_seed": 6999, "cold": false},
+        {"name": "l3-7004.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7004},
+        {"name": "l3-7005.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7005},
+        {"name": "l3-7006.json", "concurrency": 6, "prompt_tokens": 1024, "max_tokens": 512, "prompt_seed": 7006},
+        {"name": "l4-32k-64.json", "concurrency": 6, "prompt_tokens": 32768, "max_tokens": 64, "prompt_seed": 7104},
+        {"name": "l4-128k-16.json", "concurrency": 6, "prompt_tokens": 131072, "max_tokens": 16, "prompt_seed": 7204}
+      ]
+    }
+  ]
+}

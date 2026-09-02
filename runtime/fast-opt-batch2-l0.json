@@ -1,0 +1,25 @@
+{
+  "batch": 2,
+  "status": "completed_l0_rejected",
+  "time": "2026-09-02T08:14:56+08:00",
+  "candidates": [
+    {
+      "id": "pp2-tp2",
+      "status": "rejected_static",
+      "reason": "Exl3MoEMethod requires tp_size == 1"
+    },
+    {
+      "id": "pp1-tp4",
+      "status": "rejected_static",
+      "reason": "Exl3MoEMethod requires tp_size == 1"
+    }
+  ],
+  "evidence": {
+    "source": "vllm/model_executor/layers/quantization/exl3.py:339",
+    "source_sha256": "778aa815683f794c7d4ee49bb7ac743f32126cec10e7762e29417db4102862f8",
+    "documentation": "README.md:253",
+    "hardware_topology": "GPU0-GPU3 are PCIe PIX; no NVLink"
+  },
+  "service_restarts": 0,
+  "formal_changed": false
+}
