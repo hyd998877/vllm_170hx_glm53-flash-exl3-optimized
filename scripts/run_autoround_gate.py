@@ -460,6 +460,7 @@ def metrics() -> dict[str, float]:
             body, "vllm:num_requests_waiting_by_reason", 'reason="deferred"'
         ),
         "preemptions": metric(body, "vllm:num_preemptions_total"),
+        "completed": metric(body, "vllm:request_success_total"),
     }
 
 
@@ -583,12 +584,13 @@ def bench(
         cwd=ROOT,
         start_new_session=True,
     )
-    peak_waiting = peak_deferred = 0.0
+    peak_running = peak_waiting = peak_deferred = 0.0
     try:
         while process.poll() is None:
             if guard is not None:
                 guard()
             state = metrics()
+            peak_running = max(peak_running, state["running"])
             peak_waiting = max(peak_waiting, state["waiting"])
             peak_deferred = max(peak_deferred, state["deferred"])
             time.sleep(1)
@@ -609,8 +611,16 @@ def bench(
     result = parse_result(out, prompt, output)
     result["peak_waiting"] = peak_waiting
     result["peak_deferred"] = peak_deferred
+    result["peak_running"] = peak_running
     result["preemptions_delta"] = after["preemptions"] - before["preemptions"]
-    if peak_waiting or peak_deferred or result["preemptions_delta"]:
+    result["completed_delta"] = after["completed"] - before["completed"]
+    if (
+        peak_running > 6
+        or peak_waiting
+        or peak_deferred
+        or result["preemptions_delta"]
+        or result["completed_delta"] != 6
+    ):
         raise GateError(f"scheduler capacity gate failed: {out}: {result}")
     return result
 
