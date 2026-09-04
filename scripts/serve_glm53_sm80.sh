@@ -10,7 +10,7 @@ DFLASH_BATCH_SCHEDULE_JSON="${DFLASH_BATCH_SCHEDULE_JSON:-}"
 MARLIN_DIR="${MARLIN_DIR:?set MARLIN_DIR to the converted Marlin sidecar directory}"
 PROFILE="${PROFILE:-multimodal}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-30002}"
+PORT="${PORT:-3000}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-4}"
 SERVED_MODEL="${SERVED_MODEL:-GLM-5.3-Flash-tr3-4bpw}"
@@ -18,7 +18,7 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-$ROOT/chat_templates/glm53-enable-thinking-switc
 TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
 EXL3_EXTENSION_DIR="${EXL3_EXTENSION_DIR:-$TORCH_EXTENSIONS_DIR/exllamav3_ext}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-3,6,9,12,15,18}"
-ADAPTIVE_PREFILL="${ADAPTIVE_PREFILL:-0}"
+ADAPTIVE_PREFILL="${ADAPTIVE_PREFILL:-1}"
 ADAPTIVE_PREFILL_MAX_TOKENS="${ADAPTIVE_PREFILL_MAX_TOKENS:-2048}"
 ADAPTIVE_PREFILL_BUSY_TOKENS="${ADAPTIVE_PREFILL_BUSY_TOKENS:-1550}"
 EXTRA_ARGS=()
@@ -72,7 +72,7 @@ for layer in $(seq 3 44); do
   [[ -s "$sidecar" ]] || { echo "missing Marlin sidecar: $sidecar" >&2; exit 2; }
 done
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,2,4,6}"
 export TORCH_EXTENSIONS_DIR
 export PYTHONPATH="$ROOT:$EXL3_EXTENSION_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_EXL3_EXTENSION_DIR="$EXL3_EXTENSION_DIR"
@@ -106,7 +106,7 @@ exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD:-256}" \
   --block-size 256 \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.96}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.970}" \
   --kv-cache-dtype auto \
   --trust-remote-code \
   --mm-processor-cache-gb 0 \

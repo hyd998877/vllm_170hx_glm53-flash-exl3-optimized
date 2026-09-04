@@ -17,15 +17,14 @@ OpenAI 兼容接口、512K 请求上限和多模态输入。
 - 上下文上限：524,288 tokens
 - 服务接口：OpenAI-compatible Chat Completions
 - 图像输入：支持；默认 `multimodal` profile 会加载视觉编码器并预留激活显存
-- 当前正式 profile：`13,12,11,9 + DFlash2 k=2 + pairpack + GMU 0.96`
+- 当前正式 profile：`13,12,11,9 + DFlash2 k=2 + pairpack + adaptive prefill + GMU 0.970`
 
 该项目针对特定 checkpoint、硬件和负载优化，不应理解为对所有模型或所有请求
 形状都更快。
 
-下一阶段并发、PP/TP、DFlash、KV 和 kernel 优化采用逐级淘汰方案，避免对每个
-候选重复运行耗时的完整 128K 测试。执行门槛、时间预算和结果格式见
-[OPTIMIZATION_EXECUTION_PLAN.md](OPTIMIZATION_EXECUTION_PLAN.md)。该文档当前为
-待批准计划，不表示其中候选已经验证通过。
+并发、PP/TP、DFlash、KV 和 kernel 优化采用逐级淘汰方案，避免对每个候选重复
+运行耗时的完整 128K 测试。已执行的门槛、原始结果和淘汰结论见
+[OPTIMIZATION_EXECUTION_PLAN.md](OPTIMIZATION_EXECUTION_PLAN.md)。
 
 ## 主要改进
 
@@ -38,7 +37,7 @@ OpenAI 兼容接口、512K 请求上限和多模态输入。
   兼容与 KV 账本诊断。
 - PP4 自定义分层、异步 pipeline hand-off、pairpack decode phase，以及仅用于
   固定并发基准的 prefill cohort barrier。
-- 可选自适应长 prefill：唯一冷请求使用大块，并发或 decode 到来后自动恢复小块，
+- 自适应长 prefill：唯一冷请求使用大块，并发或 decode 到来后自动恢复小块，
   避免用一个全局阈值同时牺牲 TTFT 和在线 ITL。
 - DFlash2 在 GLM NoPE/auxiliary RoPE 布局下的接受率修复、fused context-KV
   projection 和运行期 JIT warmup。
@@ -53,12 +52,14 @@ OpenAI 兼容接口、512K 请求上限和多模态输入。
 
 | Profile | 工作负载 | 聚合 decode | 平均每路 decode | 最低每路 | 说明 |
 |---|---:|---:|---:|---:|---|
+| 当前多模态正式配置 | 6×128K → 512 | **230.24 tok/s** | 45.90 tok/s | 38.58 tok/s | 修正共同窗口；TTFT spread 0.102 s；无 Waiting/Deferred/Preemption |
 | 文本专用热测最佳 | 6×128K → 512 | **222.48 tok/s** | 40.29 tok/s | 37.08 tok/s | `13,11,11,10`，六路 TTFT 差异约 0.20 s |
 | 文本专用长输出 | 6×128K → 8192 | **212.95 tok/s** | 37.99 tok/s | 35.47 tok/s | 全程无 Waiting/Deferred |
 | 多模态正式配置 | 6×128K → 512 | **208.01 tok/s** | 36.20 tok/s | 34.46 tok/s | `13,12,11,9`，视觉 profiling 开启 |
 
-这里的“聚合 decode”是六路完成 token 数除以共同稳态 decode 窗口，不是单路
-速度。`222.48 tok/s` 也不是包含 128K prefill 的端到端吞吐；该次端到端聚合为
+当前 230.24 tok/s 使用从最早首 token 到最晚末 token 的修正共同窗口；历史
+222.48 tok/s 使用旧热测/last-TTFT 口径，两者不构成严格配对 A/B。这里的
+“聚合 decode”不是单路速度，也不包含 128K prefill；历史 222.48 那次端到端聚合为
 11.04 tok/s，TTFT 约 264 秒。目录中曾出现 242–279 tok/s 的数值，但这些样本
 存在第六路延迟入场、Waiting/Deferred 或错峰 TTFT，因此没有作为正式最佳值。
 
@@ -136,7 +137,7 @@ export TORCH_EXTENSIONS_DIR=/models/.torch_extensions
 ```
 
 `--source shared-had` 会构建本仓库的实验性 fused/shared-Hadamard 扩展。它没有
-进入当前 208.01/222.48 tok/s 正式配置，部署时不要默认启用。
+进入当前 230.24 tok/s 正式配置，部署时不要默认启用。
 
 ### 4. 生成 Marlin INT4 sidecar
 
@@ -187,18 +188,19 @@ MODEL=/models/GLM-5.3-Flash-tr3-4bpw \
 DFLASH_MODEL=/models/GLM-5.3-Flash-DFlash2 \
 MARLIN_DIR=/models/GLM-5.3-Flash-tr3-4bpw-marlin-int4-gs64 \
 TORCH_EXTENSIONS_DIR=/models/.torch_extensions \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0,2,4,6 \
 PROFILE=multimodal \
-PORT=30002 \
+PORT=3000 \
 scripts/serve_glm53_sm80.sh
 ```
 
-要启用唯一冷请求 2048-token 自适应 prefill，可在上述命令增加：
+自适应 prefill 已是脚本默认值。要显式固定当前正式参数，可增加：
 
 ```bash
 ADAPTIVE_PREFILL=1 \
 ADAPTIVE_PREFILL_MAX_TOKENS=2048 \
 ADAPTIVE_PREFILL_BUSY_TOKENS=1550 \
+GPU_MEMORY_UTILIZATION=0.970 \
 scripts/serve_glm53_sm80.sh
 ```
 
@@ -206,9 +208,10 @@ scripts/serve_glm53_sm80.sh
 使用 2048，出现第二个请求或 decode 时每个长 prefill 块恢复
 `LONG_PREFILL_TOKEN_THRESHOLD=256`。繁忙总预算 1550 可同步容纳六路
 `6×(256+2 DFlash slots)=1548`，避免 1024 预算将六路拆成 4/2 微批；2050 只是静态
-buffer 容量。该功能目前是实验配置，完成真实 128K 冷/热 A/B 前不作为默认 profile。
+buffer 容量。正式 `6×128K→512` 已验证该配置无 Waiting/Deferred/Preemption；
+换用不同并发、上下文或显存规格时仍应重新执行容量门禁。
 
-脚本以前台进程运行并监听 `0.0.0.0:30002`。首次启动会加载约 315 GiB 的目标
+脚本以前台进程运行并监听 `0.0.0.0:3000`。首次启动会加载约 315 GiB 的目标
 权重加 sidecar 数据、初始化四个 PP worker、分配 KV cache 并完成 JIT/CUDA
 Graph warmup，通常需要数分钟。看到 `Application startup complete` 后再发请求。
 
@@ -216,7 +219,7 @@ Graph warmup，通常需要数分钟。看到 `Application startup complete` 后
 
 | `PROFILE` | 视觉 | PP 分层 | cohort barrier | 用途 |
 |---|:---:|---|:---:|---|
-| `multimodal` | 开启 | `13,12,11,9` | 关闭 | 默认生产服务；已正式验证 208.01 tok/s |
+| `multimodal` | 开启 | `13,12,11,9` | 关闭 | 默认生产服务；当前修正共同窗口 230.24 tok/s |
 | `text` | 关闭 | `13,11,11,10` | 关闭 | 普通文本服务，释放视觉激活预算 |
 | `text-benchmark` | 关闭 | `13,11,11,10` | **开启** | 仅用于严格同步的 6×128K 基准 |
 
@@ -231,9 +234,9 @@ Graph warmup，通常需要数分钟。看到 `Application startup complete` 后
 同机验证：
 
 ```bash
-curl http://127.0.0.1:30002/v1/models
+curl http://127.0.0.1:3000/v1/models
 
-curl http://127.0.0.1:30002/v1/chat/completions \
+curl http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "GLM-5.3-Flash-tr3-4bpw",
@@ -244,15 +247,15 @@ curl http://127.0.0.1:30002/v1/chat/completions \
   }'
 ```
 
-内网客户端使用 `http://<服务器IP>:30002/v1`。如果连接超时，依次确认：
+内网客户端使用 `http://<服务器IP>:3000/v1`。如果连接超时，依次确认：
 
 ```bash
-ss -ltnp | grep 30002
-curl http://127.0.0.1:30002/health
-curl http://<服务器IP>:30002/v1/models
+ss -ltnp | grep 3000
+curl http://127.0.0.1:3000/health
+curl http://<服务器IP>:3000/v1/models
 ```
 
-并检查主机防火墙/安全组是否允许 TCP 30002。将接口暴露到不可信网络前，请在
+并检查主机防火墙/安全组是否允许 TCP 3000。将接口暴露到不可信网络前，请在
 反向代理层增加鉴权和访问控制；启动脚本本身不配置 API key。
 
 ## 运行注意事项
@@ -263,8 +266,9 @@ curl http://<服务器IP>:30002/v1/models
   `Running/Waiting`，不能只看一个聚合数字。
 - DFlash2 `k=2` 是当前 SM80/PP4 的正式选择。更大的 k 虽可能提高接受长度，
   也会增加 draft、KV 和 verify 成本；本机实测没有稳定超过 k=2。
-- `gpu_memory_utilization=0.96` 已在该配置验证。继续升高不一定更快，并会压缩
-  allocator、视觉激活和运行期临时张量余量。
+- 当前 EXL3 多模态 profile 的 `gpu_memory_utilization=0.970` 已通过六路 128K
+  容量门禁；0.963/0.965 都发生过一次 hybrid KV 抢占。该值不能直接复用到不同
+  checkpoint 或 PP 分层，换模型后必须从较低值重新 profile。
 - CPU 高占用主要来自 checkpoint 读取/反序列化、tokenization、PP worker IPC、
   scheduler 和长 prompt prefill 的 host-side 准备。加载期 GPU 利用率低是正常的。
 - 服务使用 TP1/PP4。当前 EXL3 reader 明确拒绝 TP>1；不要直接改成 TP4。
@@ -324,9 +328,11 @@ combines PP4 phase-aware scheduling, sparse MLA kernels for SM80, offline
 Marlin INT4 routed-expert sidecars, DFlash2 speculative decoding, a 512K
 request limit, and multimodal OpenAI-compatible serving.
 
-The best valid text-only measurement is 222.48 aggregate decode tok/s for six
-synchronized 128K prompts with 512 output tokens; the fully profiled multimodal
-profile measured 208.01 tok/s. These are decode-only aggregate measurements on
+The current multimodal production profile measured 230.24 aggregate decode
+tok/s for six synchronized 128K prompts with 512 output tokens, using the
+corrected common decode window and no waiting, deferral, or preemption. The
+older text-only 222.48 tok/s result used a last-TTFT/hot-run window and is not a
+strictly paired comparison. These are decode-only aggregate measurements on
 the qualified four-GPU host, not end-to-end rates or universal performance
 claims. Follow the Chinese deployment guide above for the exact profiles,
 dependencies, conversion process, licenses, and operational caveats.

@@ -518,6 +518,26 @@ FCFS 从头扫描；领先的四个 prefill 会持续占满预算，第五、第
 失败原始结果为
 `runtime/adaptive-prefill-fairness-20260904/c6-128k-512-seed20260905.json`。
 
+部署 busy budget=1550 后，六路公平性和 decode 吞吐已经恢复，但 hybrid KV 的
+瞬时分组峰值比名义 token capacity 更严格。`gpu_memory_utilization=0.963` 提供
+372 个瓶颈共享 block；正式 `6×128K→512` 得到共同 decode `202.51 tok/s`、
+每路均值 `39.44 tok/s`、TTFT spread `0.20s`，但最后一段 prefill 仍出现
+`required=8, available=5` 并使一路 PREEMPTED。提高到 0.965 后瓶颈池为 382
+blocks，`6×128K→16` 仍使 `num_preemptions_total` 从 0 增到 1，尽管没有再次打印
+allocation warning；因此两档都不能晋级。下一容量候选直接使用既定安全上限
+0.970，不再以名义 `GPU KV cache size` 或测试结束时 0% usage 代替峰值验收。
+原始结果为 `runtime/adaptive-prefill-fairness-20260904/c6-128k-512-b1550-u963-tokenclock.json`
+和 `c6-128k-16-b1550-u965.json`。
+
+将正式配置提升至安全上限 `gpu_memory_utilization=0.970` 后，启动得到瓶颈池
+407 blocks、全局 KV cache `1,153,433 tokens`。最终无外部流量的
+`6×128K→512` 通过容量与公平门禁：6/6 返回完整 512 token ID，TTFT
+`326.419–326.522s`（spread `0.102s`），Waiting/Deferred=0，
+`num_preemptions_total=0`，且日志无 `KV allocation failed`/`PREEMPTED`；共同
+decode 窗口 `230.24 tok/s`，每路均值 `45.90`、中位 `41.92`、最低 `38.58`。
+相对 0.963 的 `202.51 tok/s` 提升 13.7%，正式候选晋级 0.970。原始结果为
+`runtime/adaptive-prefill-fairness-20260904/c6-128k-512-b1550-u970-tokenclock.json`。
+
 正式验证按下列顺序执行，每项只晋级不同时改变其他变量：
 
 1. 同一条 128K/154K 唯一冷前缀分别用 256、1024、2048，记录 prefill 时间、
@@ -594,6 +614,13 @@ Marlin sidecar；AutoRound 的 group-size 128 scale 开销略小，但 checkpoin
    8K/32K；只有 L3 中位提升至少 5%、L4 不回退才跑 6×128K→512。
 4. 质量门禁至少包含固定文本/代码样本、500K needle、OCR 和工具调用；性能与质量
    同时通过才替换 `/mnt/nvme0/start_glm53_3000.sh` 的正式模型，否则自动恢复 EXL3。
+
+截至 2026-09-04，AutoRound 快照仍在 ModelScope 续传（Hugging Face 直连和
+hf-mirror 探测均超时）；8 路实际约 20–30 MiB/s，16 路无提速后已回退 8 路。
+当前约 `84.7/169.0 GiB`、`20/49` 文件完整，生产 GLM 服务保持运行。配置静态
+门禁已先通过：`INCConfig.from_config` 解析为 `inc / INT4 / gs128 / symmetric /
+auto_round:auto_gptq`，相关离线测试 `13 passed`。下载完成并逐文件 Size/SHA-256
+校验通过前，禁止停止正式服务或启动 AutoRound 候选。
 
 ### 12.3 完整 warmup
 
