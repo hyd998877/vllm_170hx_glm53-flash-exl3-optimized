@@ -218,6 +218,74 @@ class DFlashSpeculator(DraftModelSpeculator):
                 }
 
     @torch.inference_mode()
+    def warmup_input_preparation(
+        self,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> None:
+        """Prime every serving DFlash input-preparation specialization.
+
+        CUDA-graph capture starts after DFlash input preparation and the
+        scheduler-realistic warmup only has a short prompt.  Consequently it
+        does not cover the larger ``BLOCK_SIZE`` values selected for chunked
+        prefill tails.  Invoke the real preparation function against the same
+        persistent buffers and block tables used by serving.  One request is
+        sufficient because the grid dimensions are not part of Triton's cache
+        key; the per-request span below selects each reachable power-of-two
+        specialization through 256.
+        """
+        target_query_lengths = (126, 62, 30, 14, 6, 2, 1)
+        target_input_buffers = self.target_input_buffers
+        num_sampled = torch.ones(1, dtype=torch.int32, device=self.device)
+        num_rejected = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+        for target_query_len in target_query_lengths:
+            if target_query_len > target_input_buffers.max_num_tokens:
+                continue
+            input_batch = InputBatch.make_dummy(
+                1, target_query_len, target_input_buffers
+            )
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.block_tables.cp_rank,
+                    self.block_tables.cp_size,
+                    self.block_tables.cp_interleave,
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
+
+        logger.info(
+            "%s input-preparation warmup covered BLOCK_SIZE "
+            "4/8/16/32/64/128/256.",
+            self._speculator_name,
+        )
+
+    @torch.inference_mode()
     def _run_model(
         self,
         num_tokens: int,

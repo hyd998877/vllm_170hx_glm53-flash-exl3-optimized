@@ -571,15 +571,15 @@ Marlin sidecar；AutoRound 的 group-size 128 scale 开销略小，但 checkpoin
 ### 12.3 完整 warmup
 
 启动 warmup 已覆盖 mHC、KPool cache/tail、prefill/decode MQA logits、Mamba
-acceptance 和 CUDA Graph。服务级探针仍发现 `_kpool_tail_seed_kernel` 与
-`_fp8_mqa_logits_kernel` 各一次 JIT。根因是 Triton 会把普通整数 `1`、16 对齐值
-和一般值做不同 specialization：warmup 的 `n_tokens=1`、`N=8192` 无法代表所有
-真实长度。
+acceptance 和 CUDA Graph。服务级复核一度发现 DFlash `_prepare_dflash_inputs_kernel`
+在首个请求 JIT；根因不是指针对齐，而是七档 DFlash dummy warmup 被放在 V1 分支，
+当前 V2 model runner 根本没有执行。
 
-实验分支把这两个只用于边界 mask/grid 的整数加入 `do_not_specialize`，避免按 prompt
-长度制造无收益的内核副本；定向测试当前为 `54 passed`，ruff 通过。最终验收要求
-重启后以 verbose JIT monitor 连续跑短、8K、128K 冷请求，推理时间窗内上述两个
-kernel 均无新编译。warmup 主要消除首次延迟尖峰，不应宣称提高稳态 tok/s。
+现已在 V2 `warmup_kernels` 收尾阶段调用 DFlash speculator 的 serving-buffer
+warmup，分别以 126/62/30/14/6/2/1 个 target query（再加 3 个 DFlash query）覆盖
+256/128/64/32/16/8/4 七档 BLOCK_SIZE；不增加模型 forward，只编译输入元数据 kernel。
+重启后在 JIT monitor 下依次完成 1K→64、8K→16、128K→16，三段均无运行期 JIT，
+因此第 7 项正式通过。warmup 主要消除首次延迟尖峰，不宣称提高稳态 tok/s。
 
 ### 12.4 FlashMLA、DeepGEMM、SM90/SM100 与 V4 integration
 

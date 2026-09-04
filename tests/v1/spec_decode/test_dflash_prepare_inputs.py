@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
     _prepare_dflash_inputs_kernel,
     prepare_dflash_inputs,
 )
@@ -40,6 +42,60 @@ def test_request_metadata_alignment_does_not_specialize() -> None:
         "block_table_ptr",
     }
     assert set(_prepare_dflash_inputs_kernel.do_not_specialize_on_alignment) == expected
+
+
+def test_warmup_input_preparation_covers_power_of_two_classes(monkeypatch) -> None:
+    import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash
+
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        dflash,
+        "prepare_dflash_inputs",
+        lambda *args: calls.append(
+            (int(args[9].num_scheduled_tokens.max()), args[22])
+        ),
+    )
+
+    max_num_tokens = 256
+    input_buffers = InputBuffers(6, max_num_tokens, torch.device("cpu"))
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.device = torch.device("cpu")
+    speculator.target_input_buffers = input_buffers
+    speculator.input_buffers = input_buffers
+    speculator.draft_kv_cache_group_ids = [0]
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=torch.zeros((1, max_num_tokens), dtype=torch.int64),
+        input_block_tables=[torch.zeros((6, 4), dtype=torch.int32)],
+        kernel_block_sizes=[16],
+        cp_rank=0,
+        cp_size=1,
+        cp_interleave=1,
+    )
+    speculator.context_positions = torch.zeros(max_num_tokens, dtype=torch.int64)
+    speculator._context_slot_mappings = torch.zeros(
+        (1, max_num_tokens), dtype=torch.int64
+    )
+    speculator.sample_indices = torch.zeros(12, dtype=torch.int64)
+    speculator.sample_pos = torch.zeros(12, dtype=torch.int64)
+    speculator.sample_idx_mapping = torch.zeros(12, dtype=torch.int32)
+    speculator.temperature = torch.zeros(6)
+    speculator.seeds = torch.zeros(6, dtype=torch.int64)
+    speculator.parallel_drafting_token_id = 0
+    speculator.num_query_per_req = 3
+    speculator.num_speculative_steps = 2
+    speculator.max_num_reqs = 6
+    speculator.max_num_tokens = max_num_tokens
+    speculator.max_model_len = 524288
+    speculator.sample_from_anchor = False
+
+    speculator.warmup_input_preparation(
+        torch.zeros(6, dtype=torch.int64),
+        torch.zeros(6, dtype=torch.int32),
+        torch.zeros(6),
+        torch.zeros(6, dtype=torch.int64),
+    )
+
+    assert calls == [(126, 3), (62, 3), (30, 3), (14, 3), (6, 3), (2, 3), (1, 3)]
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"

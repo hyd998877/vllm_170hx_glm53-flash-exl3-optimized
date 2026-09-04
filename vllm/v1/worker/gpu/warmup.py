@@ -414,4 +414,21 @@ def warmup_kernels(
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
+
+    # DFlash input preparation happens eagerly before the captured draft
+    # forward. The ordinary short warmup above cannot select every BLOCK_SIZE
+    # used by chunked-prefill tails, so let the speculator prime those kernels
+    # directly with its serving buffers. Other speculators are a no-op.
+    speculator = getattr(model_runner, "speculator", None)
+    warmup_input_preparation = getattr(
+        speculator, "warmup_input_preparation", None
+    )
+    if warmup_input_preparation is not None:
+        assert model_runner.sampler is not None
+        warmup_input_preparation(
+            model_runner.req_states.last_sampled_tokens,
+            model_runner.req_states.next_prefill_tokens,
+            model_runner.sampler.sampling_states.temperature.gpu,
+            model_runner.sampler.sampling_states.seeds.gpu,
+        )
     torch.accelerator.synchronize()

@@ -841,31 +841,11 @@ class Worker(WorkerBase):
             )
 
             # We skip EPLB here since we don't want to record dummy metrics
-            # DFlash input preparation chooses a Triton BLOCK_SIZE from the
-            # largest per-request target query. CUDA-graph capture only runs
-            # the draft forward and the old one-token dummy pass covered just
-            # BLOCK_SIZE=4, leaving ordinary prefill tails (8..256) to JIT in
-            # the first user request. Use small serving-style dummy prefills
-            # to prime every reachable power-of-two class. The largest pass is
-            # still only 6*126=756 tokens in the production profile.
-            dflash_query_tokens = (1,)
-            speculator = getattr(self.model_runner, "speculator", None)
-            if speculator is not None and speculator.__class__.__name__ in {
-                "DFlashSpeculator",
-                "DFlash2Speculator",
-            }:
-                # End on the original one-token shape so the subsequent
-                # sampler warmup does not materialize logits for 756 rows.
-                dflash_query_tokens = (126, 62, 30, 14, 6, 2, 1)
-
-            hidden_states = last_hidden_states = None
-            for query_tokens in dflash_query_tokens:
-                hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                    num_tokens=max_num_reqs * query_tokens,
-                    skip_eplb=True,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                )
-            assert hidden_states is not None and last_hidden_states is not None
+            hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                num_tokens=max_num_reqs,
+                skip_eplb=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
