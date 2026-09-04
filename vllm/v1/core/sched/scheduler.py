@@ -382,6 +382,15 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _get_long_prefill_token_threshold(self, request: Request) -> int:
+        return self.scheduler_config.long_prefill_token_threshold
+
+    def _get_token_budget(self) -> int:
+        return self.max_num_scheduled_tokens
+
+    def _get_input_budget(self) -> int:
+        return self.scheduler_config.max_num_batched_tokens
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -429,7 +438,12 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end and not use_internal_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            get_threshold = getattr(self, "_get_long_prefill_token_threshold", None)
+            long_prefill_threshold = (
+                get_threshold(request)
+                if get_threshold is not None
+                else self.scheduler_config.long_prefill_token_threshold
+            )
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -517,10 +531,10 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        token_budget = self._get_token_budget()
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
-        input_budget = self.scheduler_config.max_num_batched_tokens
+        input_budget = self._get_input_budget()
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -596,8 +610,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            threshold = self._get_long_prefill_token_threshold(request)
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -997,7 +1012,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = self._get_long_prefill_token_threshold(request)
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 

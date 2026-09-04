@@ -18,6 +18,112 @@ from .utils import create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
+def _create_adaptive_prefill_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool = True,
+    adaptive_max_tokens: int = 2048,
+    max_num_batched_tokens: int = 2050,
+) -> AsyncScheduler:
+    monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL", str(int(enabled)))
+    monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS", str(adaptive_max_tokens))
+    monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS", "1024")
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_model_len=8192,
+        max_num_batched_tokens=max_num_batched_tokens,
+        long_prefill_token_threshold=256,
+    )
+    assert isinstance(scheduler, AsyncScheduler)
+    return scheduler
+
+
+def test_adaptive_prefill_tracks_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second request must restore the latency-safe chunk immediately."""
+    scheduler = _create_adaptive_prefill_scheduler(monkeypatch)
+    first, second = create_requests(2, num_tokens=7168)
+
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[first.request_id] == 2048
+
+    scheduler.add_request(second)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[first.request_id] == 256
+    assert output.num_scheduled_tokens[second.request_id] == 256
+
+    scheduler.finish_requests(second.request_id, RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[first.request_id] == 2048
+
+
+def test_adaptive_prefill_yields_to_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending decode must keep a newly admitted cold prefill at 256."""
+    scheduler = _create_adaptive_prefill_scheduler(monkeypatch)
+    (decode_request,) = create_requests(1, num_tokens=8, req_ids=["decode"])
+    (cold_request,) = create_requests(1, num_tokens=4096, req_ids=["cold"])
+
+    scheduler.add_request(decode_request)
+    scheduler.schedule()
+    assert not decode_request.is_prefill_chunk
+
+    scheduler.add_request(cold_request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[cold_request.request_id] == 256
+
+
+def test_adaptive_prefill_preserves_busy_batch_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Increasing the idle buffer must not increase the busy batch budget."""
+    scheduler = _create_adaptive_prefill_scheduler(
+        monkeypatch, max_num_batched_tokens=2050
+    )
+    requests = create_requests(6, num_tokens=4096)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 1024
+    assert len(output.num_scheduled_tokens) == 4
+    assert set(output.num_scheduled_tokens.values()) == {256}
+
+
+@pytest.mark.parametrize(
+    ("enabled", "adaptive_max_tokens", "max_num_batched_tokens", "expected"),
+    [
+        (False, 1024, 1024, 256),
+        (True, 512, 1024, 512),
+        (True, 2048, 512, 512),
+    ],
+)
+def test_adaptive_prefill_respects_configuration_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    adaptive_max_tokens: int,
+    max_num_batched_tokens: int,
+    expected: int,
+) -> None:
+    scheduler = _create_adaptive_prefill_scheduler(
+        monkeypatch,
+        enabled=enabled,
+        adaptive_max_tokens=adaptive_max_tokens,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+    (request,) = create_requests(1, num_tokens=4096)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == expected
+
+
 def _make_model_runner_output(
     scheduler_output: SchedulerOutput,
 ) -> ModelRunnerOutput:

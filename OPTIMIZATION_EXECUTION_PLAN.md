@@ -462,3 +462,62 @@ MBT=768 完成三次配对 L3 和长上下文代理。聚合中位相对 MBT=102
 末 token）。历史 208.01/222.48 是旧的 last-TTFT 或热测口径，仍保留作历史记录，
 不能与本轮新口径直接比较；因此本轮没有虚构新的“冠军”。正式实例最终恢复并核验
 为 `0.0.0.0:30002`，命令行仍为 DFlash2 k=2、视觉路径、PP 分层 `13,12,11,9`。
+
+## 11. 100K+ 冷前缀加速：自适应 prefill（2026-09-04）
+
+线上样本已确认 153,789-token 请求总耗时 335.65 秒，其中 prefill 116.27 秒、
+decode 218.78 秒、排队约 0 秒。服务没有 Waiting、Deferred 或 preemption；慢点是
+新前缀的实际计算。固定 `long_prefill_token_threshold=256` 会把该输入拆成至少
+601 个调度片段，放大 PP4 气泡、host 调度、跨 stage 通信和混合 Mamba/MLA 状态
+保存成本。
+
+实验分支 `exp/adaptive-prefill-20260904` 增加二态调度：
+
+- 只有一个未完成请求、该请求仍在首次 prompt prefill 且尚无输出 token 时，单块
+  上限提高到 2048；
+- 一旦第二个请求进入，或存在 decode/恢复生成，下一调度步恢复配置的 256；
+- 繁忙状态的总调度/输入预算也恢复 1024，避免仅扩大 runner 静态 buffer 后意外
+  改变原有六路批处理行为；
+- 并发消失后，如果原请求仍在 prompt prefill，可重新进入 2048；
+- 开关默认关闭；生产包装脚本显式启用。DFlash k=2 还需要两个输入槽，因此 runner
+  容量设为 2050，净 prefill 上限才是 2048；
+- 已经提交到 GPU 的大块不能撤销。Async PP 可同时保有多步 in-flight，因此第二个
+  请求的最坏额外等待不只一个块；需在服务 A/B 中记录到达时的在途深度与 p95/max
+  ITL，这是 TTFT 收益与在线抢占粒度之间的主要代价。
+
+功能门禁已通过：AsyncScheduler、Mamba 对齐与 partial-prefix-cache 定向测试合计
+`95 passed`。当前结论仍为 `functional-only`，正式 3000 服务尚未重启，不能在真实
+冷/热 A/B 完成前宣称 TTFT 提升。
+
+正式验证按下列顺序执行，每项只晋级不同时改变其他变量：
+
+1. 同一条 128K/154K 唯一冷前缀分别用 256、1024、2048，记录 prefill 时间、
+   TTFT、每 stage GPU 利用率和调度步数；2048 相对 1024 改善不足 3% 就保留 1024。
+2. 在 2048 prefill 进行中注入短 decode，验证下一步块大小为 256，并记录 decode
+   ITL 的 p50/p95/max；p95 回退超过 10% 则降低空闲块到 1024。
+3. 回归 `6×128K→512`，要求 Waiting/Deferred/Preemption 都为 0，聚合 decode 与
+   当前正式基线差异不超过 3%。
+4. 重复相同请求验证 prefix-cache 热路径没有回退，并确认 500K needle 与 OCR
+   正确性仍通过。
+
+除放大空闲块外，冷请求方向按预期收益/成本排序如下：
+
+1. **提高真实 prefix-cache 命中率**：固定 system prompt、tool 顺序、JSON
+   序列化和模板版本，不把时间戳、随机 ID 放在公共前缀。它不能加快第一次真正冷
+   计算，但对重复会话通常是收益最大的路径。
+2. **会话粘性与跨轮 KV 保留**：同一会话固定路由到同一实例；多实例再评估主机或
+   NVMe KV connector。它减少重复 prefill，不会缩短全新前缀的第一次计算。
+3. **预填充专用队列/P-D 分离**：prefill 实例用大 MBT，decode 实例保持小块和低
+   ITL。理论上最能兼顾 TTFT 与在线 decode，但四卡条件下会引入 KV 传输且无法在
+   同一时刻各自保有完整 PP4，需先做容量设计。
+4. **优化 GPU 拓扑**：PP 相邻 stage 尽量使用全 PIX 的连续 GPU；当前 0,2,4,6
+   在 2→4 间跨 PHB。用户指定拓扑不自动更改，只作为独立 A/B 候选。
+5. **长 prefill kernel/JIT**：补齐 1024/2048 shape 的 warmup specialization，
+   profile GLM sparse-MLA indexer、KPool 与 Mamba 状态 kernel，再只融合占比明确的
+   路径。它能缩短真正冷计算，但开发成本高于调度优化。
+6. **请求侧约束**：简单问答降低 reasoning 强度并限制 `max_tokens`。这不改变
+   TTFT，但可直接减少已观测到的 218.78 秒 decode，从而改善用户看到的总时延。
+
+不把 DFlash 作为冷 prefill 加速项：它主要提高 decode，既有 A/B 显示其 TTFT
+约增加 14%。可研究“prefill 不运行 draft、进入 decode 后启用”，但动态切换涉及
+KV/runner 状态，必须独立于本次自适应 chunk 验证。

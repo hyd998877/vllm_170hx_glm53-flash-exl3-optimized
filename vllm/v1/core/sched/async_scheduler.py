@@ -45,6 +45,44 @@ class AsyncScheduler(Scheduler):
         self._pp_prefill_final_chunk = (
             self.scheduler_config.long_prefill_token_threshold
         )
+        self._adaptive_prefill_enabled = envs.VLLM_PP_ADAPTIVE_PREFILL
+        speculative_config = self.vllm_config.speculative_config
+        draft_slots = (
+            speculative_config.max_num_new_slots_for_drafting
+            if speculative_config is not None
+            else 0
+        )
+        self._adaptive_prefill_max_tokens = min(
+            envs.VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS,
+            self.scheduler_config.max_num_batched_tokens - draft_slots,
+            self.max_num_scheduled_tokens,
+        )
+        self._adaptive_prefill_busy_tokens = min(
+            envs.VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS,
+            self.scheduler_config.max_num_batched_tokens,
+            self.max_num_scheduled_tokens,
+        )
+        self._adaptive_prefill_request_id: str | None = None
+        if self._adaptive_prefill_enabled:
+            if self.scheduler_config.long_prefill_token_threshold <= 0:
+                raise ValueError(
+                    "--long-prefill-token-threshold must be positive when "
+                    "adaptive prefill is enabled"
+                )
+            if self._adaptive_prefill_max_tokens <= 0:
+                raise ValueError("VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS must be positive")
+            if self._adaptive_prefill_busy_tokens <= draft_slots:
+                raise ValueError(
+                    "VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS must exceed the "
+                    "speculative draft-slot reservation"
+                )
+            logger.info(
+                "Adaptive PP prefill enabled: idle_chunk=%d busy_chunk=%d "
+                "busy_budget=%d",
+                self._adaptive_prefill_max_tokens,
+                self.scheduler_config.long_prefill_token_threshold,
+                self._adaptive_prefill_busy_tokens,
+            )
         if self._pp_prefill_cohort_barrier:
             if self._pp_prefill_cohort_size < 2:
                 raise ValueError("VLLM_PP_PREFILL_COHORT_SIZE must be at least 2")
@@ -59,6 +97,7 @@ class AsyncScheduler(Scheduler):
                 )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._update_adaptive_prefill_request()
         if self._pp_prefill_cohort_barrier:
             self._update_prefill_cohort_barrier()
         scheduler_output = super().schedule(throttle_prefills)
@@ -75,6 +114,81 @@ class AsyncScheduler(Scheduler):
             )
             scheduler_output = super().schedule(throttle_prefills)
         return scheduler_output
+
+    def _update_adaptive_prefill_request(self) -> None:
+        previous_request_id = self._adaptive_prefill_request_id
+        adaptive_request_id = None
+        exit_reason = "disabled"
+        if self._adaptive_prefill_enabled:
+            active_requests = [
+                request
+                for request in self.requests.values()
+                if not request.is_finished()
+            ]
+            if len(active_requests) == 1:
+                request = active_requests[0]
+                if (
+                    request.num_output_tokens == 0
+                    and request.num_computed_tokens < request.num_prompt_tokens
+                    and request.status
+                    in (
+                        RequestStatus.WAITING,
+                        RequestStatus.RUNNING,
+                        RequestStatus.PREEMPTED,
+                    )
+                ):
+                    adaptive_request_id = request.request_id
+                else:
+                    exit_reason = "decode-or-non-runnable"
+            elif len(active_requests) > 1:
+                exit_reason = (
+                    "decode"
+                    if any(
+                        request.num_output_tokens > 0
+                        or request.num_computed_tokens >= request.num_prompt_tokens
+                        for request in active_requests
+                    )
+                    else "concurrency"
+                )
+            else:
+                exit_reason = "idle"
+
+        self._adaptive_prefill_request_id = adaptive_request_id
+        request_changed = adaptive_request_id != previous_request_id
+        if previous_request_id is not None and request_changed:
+            logger.info(
+                "Adaptive PP prefill exited: request=%s reason=%s chunk=%d",
+                previous_request_id,
+                exit_reason,
+                self.scheduler_config.long_prefill_token_threshold,
+            )
+        if adaptive_request_id is not None and request_changed:
+            logger.info(
+                "Adaptive PP prefill entered: request=%s chunk=%d",
+                adaptive_request_id,
+                self._adaptive_prefill_max_tokens,
+            )
+
+    def _get_long_prefill_token_threshold(self, request: Request) -> int:
+        if request.request_id == self._adaptive_prefill_request_id:
+            return self._adaptive_prefill_max_tokens
+        return super()._get_long_prefill_token_threshold(request)
+
+    def _get_token_budget(self) -> int:
+        if (
+            self._adaptive_prefill_enabled
+            and self._adaptive_prefill_request_id is None
+        ):
+            return self._adaptive_prefill_busy_tokens
+        return super()._get_token_budget()
+
+    def _get_input_budget(self) -> int:
+        if (
+            self._adaptive_prefill_enabled
+            and self._adaptive_prefill_request_id is None
+        ):
+            return self._adaptive_prefill_busy_tokens
+        return super()._get_input_budget()
 
     def _should_release_stalled_prefill_cohort(
         self, scheduler_output: SchedulerOutput

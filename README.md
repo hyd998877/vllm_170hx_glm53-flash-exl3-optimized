@@ -38,6 +38,8 @@ OpenAI 兼容接口、512K 请求上限和多模态输入。
   兼容与 KV 账本诊断。
 - PP4 自定义分层、异步 pipeline hand-off、pairpack decode phase，以及仅用于
   固定并发基准的 prefill cohort barrier。
+- 可选自适应长 prefill：唯一冷请求使用大块，并发或 decode 到来后自动恢复小块，
+  避免用一个全局阈值同时牺牲 TTFT 和在线 ITL。
 - DFlash2 在 GLM NoPE/auxiliary RoPE 布局下的接受率修复、fused context-KV
   projection 和运行期 JIT warmup。
 - CUDA Graph `FULL_DECODE_ONLY`，针对 3/6/9/12/15/18 token batch 捕获。
@@ -190,6 +192,20 @@ PROFILE=multimodal \
 PORT=30002 \
 scripts/serve_glm53_sm80.sh
 ```
+
+要启用唯一冷请求 2048-token 自适应 prefill，可在上述命令增加：
+
+```bash
+ADAPTIVE_PREFILL=1 \
+ADAPTIVE_PREFILL_MAX_TOKENS=2048 \
+ADAPTIVE_PREFILL_BUSY_TOKENS=1024 \
+scripts/serve_glm53_sm80.sh
+```
+
+脚本会为 DFlash k=2 自动把 runner 输入容量设为 2050；只有唯一 prompt prefill
+使用 2048，出现第二个请求或 decode 时总批预算恢复 1024、每个长 prefill 块恢复
+`LONG_PREFILL_TOKEN_THRESHOLD=256`。2050 是静态 buffer 容量，不代表繁忙调度也会
+使用 2050。该功能目前是实验配置，完成真实 128K 冷/热 A/B 前不作为默认 profile。
 
 脚本以前台进程运行并监听 `0.0.0.0:30002`。首次启动会加载约 315 GiB 的目标
 权重加 sidecar 数据、初始化四个 PP worker、分配 KV cache 并完成 JIT/CUDA
