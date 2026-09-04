@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHER="${LAUNCHER:-/mnt/nvme0/keys-vllm-glm53/launcher/launch_cmp170hx.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/mnt/nvme0/keys-vllm-glm53/.venv/bin/python}"
 MODEL="${MODEL:-/mnt/nvme0/models/GLM-5.3-Flash-W4A16-AutoRound}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-$ROOT/chat_templates/glm53-enable-thinking-switch.jinja}"
 
 [[ -x "$LAUNCHER" ]] || { echo "missing launcher: $LAUNCHER" >&2; exit 2; }
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 2; }
@@ -45,6 +46,7 @@ print(f"validated AutoRound snapshot index: {len(shards)} shards")
 PY
 
 export MODEL
+export CHAT_TEMPLATE
 export SERVED_MODEL="${SERVED_MODEL:-GLM-5.3-Flash-W4A16-AutoRound}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,2,4,6}"
 export HOST="${HOST:-0.0.0.0}"
@@ -93,5 +95,27 @@ export CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
 export CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-3,6,9,12,15,18}"
 export JIT_MONITOR_MODE="${JIT_MONITOR_MODE:-warn}"
 export JIT_MONITOR_VERBOSE="${JIT_MONITOR_VERBOSE:-1}"
+
+if [[ "${1:-}" == "validate" ]]; then
+  [[ -f "$CHAT_TEMPLATE" ]] || {
+    echo "missing chat template: $CHAT_TEMPLATE" >&2
+    exit 2
+  }
+  [[ -f "$DFLASH_MODEL/config.json" ]] || {
+    echo "missing DFlash2 config: $DFLASH_MODEL/config.json" >&2
+    exit 2
+  }
+  [[ -f "$DFLASH_MODEL/model.safetensors" ]] || {
+    echo "missing DFlash2 weights: $DFLASH_MODEL/model.safetensors" >&2
+    exit 2
+  }
+  if awk -v util="$UTIL" -v cap="$UTIL_CAP" \
+    'BEGIN { exit !(util > cap) }'; then
+    echo "UTIL=$UTIL exceeds UTIL_CAP=$UTIL_CAP" >&2
+    exit 2
+  fi
+  echo "AutoRound candidate profile validation passed."
+  exit 0
+fi
 
 exec "$LAUNCHER" "${1:-start}"
