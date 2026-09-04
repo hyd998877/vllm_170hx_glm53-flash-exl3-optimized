@@ -214,11 +214,37 @@ class AsyncScheduler(Scheduler):
     def _adaptive_prefill_priority(self, request: Request) -> int:
         return request.priority if self.policy == SchedulingPolicy.PRIORITY else 0
 
+    def _admissible_adaptive_prefills(self) -> list[Request]:
+        prefills = self._active_adaptive_prefills()
+        running_ids = {request.request_id for request in self.running}
+        running_prefills = [
+            request for request in prefills if request.request_id in running_ids
+        ]
+        available_slots = max(
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input,
+            0,
+        )
+        if available_slots == 0:
+            return running_prefills
+
+        waiting_prefills = [
+            request for request in prefills if request.request_id not in running_ids
+        ]
+        waiting_prefills.sort(
+            key=lambda request: (
+                self._adaptive_prefill_priority(request),
+                request.arrival_time,
+            )
+        )
+        return running_prefills + waiting_prefills[:available_slots]
+
     def _balance_adaptive_prefills(self) -> None:
         """Keep concurrent prefills within one scheduling quantum."""
         self._balanced_prefill_ids.clear()
         self._min_prefill_tokens_by_priority.clear()
-        prefills = self._active_adaptive_prefills()
+        prefills = self._admissible_adaptive_prefills()
         if len(prefills) < 2:
             return
 
@@ -240,15 +266,12 @@ class AsyncScheduler(Scheduler):
                     request.num_computed_tokens
                 )
 
-        active_requests = [
-            request
-            for request in self.requests.values()
-            if not request.is_finished()
-        ]
-        if len(prefills) != len(active_requests):
-            return
-
         prefill_ids = {request.request_id for request in prefills}
+        if any(
+            not request.is_finished() and request.request_id not in prefill_ids
+            for request in self.running
+        ):
+            return
         self.running.sort(
             key=lambda request: (
                 self._adaptive_prefill_priority(request),

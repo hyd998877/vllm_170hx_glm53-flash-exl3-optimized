@@ -24,6 +24,7 @@ def _create_adaptive_prefill_scheduler(
     enabled: bool = True,
     adaptive_max_tokens: int = 2048,
     max_num_batched_tokens: int = 2050,
+    max_num_seqs: int = 16,
 ) -> AsyncScheduler:
     monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL", str(int(enabled)))
     monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS", str(adaptive_max_tokens))
@@ -32,6 +33,7 @@ def _create_adaptive_prefill_scheduler(
     scheduler = create_scheduler(
         async_scheduling=True,
         max_model_len=8192,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         long_prefill_token_threshold=256,
     )
@@ -121,6 +123,26 @@ def test_adaptive_prefill_balances_more_requests_than_busy_batch_slots(
     computed_tokens = [request.num_computed_tokens for request in requests]
     assert requests[5].num_computed_tokens > 0
     assert max(computed_tokens) - min(computed_tokens) <= 256
+
+
+def test_adaptive_prefill_does_not_yield_to_unadmittable_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seventh waiting prefill must not stall six running prefills."""
+    scheduler = _create_adaptive_prefill_scheduler(monkeypatch, max_num_seqs=6)
+    requests = create_requests(7, num_tokens=7168)
+
+    for request in requests[:6]:
+        scheduler.add_request(request)
+    while len(scheduler.running) < 6:
+        scheduler.schedule()
+
+    scheduler.add_request(requests[6])
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens > 0
+    assert requests[6].request_id not in output.num_scheduled_tokens
+    assert len(scheduler.running) == 6
 
 
 @pytest.mark.parametrize(

@@ -500,7 +500,11 @@ FCFS 从头扫描；领先的四个 prefill 会持续占满预算，第五、第
 并造成 decode/prefill 长时间混跑。候选修复在并发纯 prefill 时按
 `num_computed_tokens` 最少者优先，并让领先 RUNNING 请求为落后的 WAITING prefill
 让路。它不恢复固定六路 cohort barrier，也不延迟真正单路的首个 2048-token 块。
-离线自适应定向回归 `7 passed`、完整 AsyncScheduler 回归 `27 passed`；其中新用例
+首次服务级尝试又遇到一条外部业务请求，且发现满 6 路后第 7 路 WAITING 不能参与
+公平水位，否则六个已运行请求会全部为暂时不可接纳的请求让步，形成零工作调度。
+候选已把公平集合限制为 RUNNING 加当前剩余 sequence slot 可接纳的 WAITING；满载
+时第 7 路不参与水位计算。离线自适应定向回归 `8 passed`、完整 AsyncScheduler
+回归 `28 passed`；其中新用例
 覆盖“先到一路 2048、随后五路到达”并要求最终进度差不超过 256。需重启后的
 服务级 A/B 才能晋级正式配置。失败原始结果为
 `runtime/adaptive-prefill-20260904/c6-128k-512-clean-20260904.json`。
