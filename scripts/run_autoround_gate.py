@@ -596,7 +596,14 @@ def bench(
             raise GateError(f"benchmark failed with rc={process.returncode}: {out}")
     except BaseException:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
         raise
     after = metrics()
     result = parse_result(out, prompt, output)
@@ -632,8 +639,8 @@ def api_smokes(
             "chat_template_kwargs": {"enable_thinking": False},
         },
     )
-    if not response_text(text):
-        raise GateError("text API smoke returned no content")
+    if response_text(text).strip() != "OK":
+        raise GateError(f"text API smoke mismatch: {response_text(text)!r}")
     if guard is not None:
         guard()
 
@@ -780,6 +787,12 @@ def run_monitored(
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
         raise
 
 
