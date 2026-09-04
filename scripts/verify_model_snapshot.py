@@ -9,6 +9,7 @@ corrupt files. Unlisted local notes/backups are ignored.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import pathlib
@@ -39,7 +40,10 @@ def main() -> int:
     parser.add_argument("snapshot", type=pathlib.Path)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--revision", default="master")
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
 
     expected = _metadata(args.model_id, args.revision)
     if not expected:
@@ -47,6 +51,7 @@ def main() -> int:
 
     root = args.snapshot.resolve()
     failures: list[str] = []
+    hash_jobs: list[tuple[str, pathlib.Path, str]] = []
     for name, item in sorted(expected.items()):
         path = root / name
         size = int(item.get("Size", -1))
@@ -58,14 +63,23 @@ def main() -> int:
         if actual_size != size:
             failures.append(f"size: {name}: expected {size}, got {actual_size}")
             continue
-        if digest and _sha256(path) != digest:
-            failures.append(f"sha256: {name}")
+        if digest:
+            hash_jobs.append((name, path, digest))
+
+    def verify_hash(job: tuple[str, pathlib.Path, str]) -> str | None:
+        name, path, expected_digest = job
+        return None if _sha256(path) == expected_digest else f"sha256: {name}"
+
+    with concurrent.futures.ThreadPoolExecutor(args.workers) as executor:
+        for failure in executor.map(verify_hash, hash_jobs):
+            if failure is not None:
+                failures.append(failure)
 
     if failures:
         print("snapshot verification failed:", file=sys.stderr)
         print("\n".join(failures), file=sys.stderr)
         return 1
-    print(f"verified {len(expected)} files in {root}")
+    print(f"verified {len(expected)} files in {root} with {args.workers} workers")
     return 0
 
 
