@@ -622,6 +622,14 @@ hf-mirror 探测均超时）；8 路实际约 20–30 MiB/s，16 路无提速后
 auto_round:auto_gptq`，相关离线测试 `13 passed`。下载完成并逐文件 Size/SHA-256
 校验通过前，禁止停止正式服务或启动 AutoRound 候选。
 
+后续服务级验证已固化为 `scripts/run_autoround_gate.py`：执行前锁定 3001 和
+GPU `1,3,5,7` 的 PID/starttime/cmdline/GPU-process 快照，先对当前 EXL3 重跑
+同 seed L3/L4 基线，再排空并切换 3000。AutoRound 依次经过 API/OCR、1K warmup、
+三次 6×1K→512、8K/32K、KV capacity、6×128K→512、500K needle 和运行期 JIT
+门禁；L3 中位未提高 5% 时即停止，不浪费 128K 时间。无论成功、失败或收到
+SIGTERM/SIGHUP，`finally` 都停止候选并恢复 `/mnt/nvme0/start_glm53_3000.sh`；
+DeepSeek 身份变化或目标 GPU 出现未知进程则 fail-closed。
+
 ### 12.3 完整 warmup
 
 启动 warmup 已覆盖 mHC、KPool cache/tail、prefill/decode MQA logits、Mamba
