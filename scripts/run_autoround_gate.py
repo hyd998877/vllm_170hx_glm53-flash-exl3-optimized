@@ -871,6 +871,15 @@ def run_gate(out_dir: Path) -> dict[str, Any]:
 
     api_smokes("GLM-5.3-Flash-tr3-4bpw", baseline_dir, formal_guard)
     formal_guard()
+    bench(
+        baseline_dir / "warmup-1k-512.json",
+        "GLM-5.3-Flash-tr3-4bpw",
+        EXL3_MODEL,
+        1024,
+        512,
+        20260920,
+        formal_guard,
+    )
 
     baseline = [
         bench(
@@ -938,11 +947,11 @@ def run_gate(out_dir: Path) -> dict[str, Any]:
         )
         guard()
         bench(
-            out_dir / "autoround/warmup-1k-16.json",
+            out_dir / "autoround/warmup-1k-512.json",
             "GLM-5.3-Flash-W4A16-AutoRound",
             MODEL,
             1024,
-            16,
+            512,
             20260920,
             guard,
         )
