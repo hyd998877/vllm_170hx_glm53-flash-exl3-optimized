@@ -184,6 +184,7 @@ class ChunkedTokenDatabase:
             )
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        self.block_strides: list[int] = []
         self._key_prefix = PoolKey.build_prefix(metadata)
 
     def key_for(self, chunk_hash: BlockHash) -> str:
@@ -194,6 +195,9 @@ class ChunkedTokenDatabase:
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+
+    def set_block_strides(self, block_strides: list[int]):
+        self.block_strides = block_strides
 
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
@@ -221,11 +225,17 @@ class ChunkedTokenDatabase:
         if not chunks:
             return [], [], []
         base = np.asarray(self.kv_caches_base_addr, dtype=np.int64)
-        length = len(self.block_len)
-        blen = np.asarray(
-            [self.block_len[i % length] for i in range(base.shape[0])],
-            dtype=np.int64,
-        )
+        if self.block_strides:
+            copy_size = np.asarray(self.block_len, dtype=np.int64)
+            block_stride = np.asarray(self.block_strides, dtype=np.int64)
+            assert base.shape == copy_size.shape == block_stride.shape
+        else:
+            num_sizes = len(self.block_len)
+            copy_size = np.asarray(
+                [self.block_len[i % num_sizes] for i in range(base.shape[0])],
+                dtype=np.int64,
+            )
+            block_stride = copy_size
         n = len(chunks)
         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
@@ -235,20 +245,35 @@ class ChunkedTokenDatabase:
             dtype=np.int64,
             count=n,
         )
-        addrs = base[None, :] + bids[:, None] * blen[None, :]
+        addrs = base[None, :] + bids[:, None] * block_stride[None, :]
         block_counts = (spans + self.block_size - 1) // self.block_size
-        sizes = blen[None, :] * block_counts[:, None]
+        if (
+            self.block_strides
+            and not (block_counts == 1).all()
+            and (block_stride != copy_size).any()
+        ):
+            raise ValueError(
+                "strided KV regions cannot represent multiple blocks as one "
+                "contiguous transfer"
+            )
+        sizes = copy_size[None, :] * block_counts[:, None]
         return addrs.tolist(), sizes.tolist(), bids.tolist()
 
     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
         """Return addresses and sizes for one physical block slot."""
         addr_list = []
         size_list = []
-        length = len(self.block_len)
+        num_sizes = len(self.block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
-            addr = base_addr + block_id * self.block_len[index % length]
+            size_index = index if self.block_strides else index % num_sizes
+            block_stride = (
+                self.block_strides[index]
+                if self.block_strides
+                else self.block_len[size_index]
+            )
+            addr = base_addr + block_id * block_stride
             addr_list.append(addr)
-            size_list.append(self.block_len[index % length])
+            size_list.append(self.block_len[size_index])
         return addr_list, size_list
 
     def process_tokens(

@@ -1319,6 +1319,12 @@ def test_project_kv_cache_groups_to_worker():
     assert isinstance(proj_spec, UniformTypeKVCacheSpecs)
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
+    nontransfer_group = KVCacheGroupSpec(["layer1"], spec_a, enable_kv_transfer=False)
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        [nontransfer_group], {"layer1": spec_a}
+    )
+    assert not projected[0].enable_kv_transfer
+
 
 @pytest.mark.parametrize(
     "layer_type,dcp_size,expected_width",
@@ -2347,6 +2353,7 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     # The tail never prefix-caches; its page is padded up to the indexer page
     # so the runner's strided view rides the indexer storage.
     assert not tail_group.kv_cache_spec.participates_in_prefix_caching
+    assert not tail_group.enable_kv_transfer
     tail_inner = cast(
         KpoolTailSpec, tail_group.kv_cache_spec.kv_cache_specs["layers.3.tail"]
     )
@@ -2375,6 +2382,7 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     assert layout is not None
     assert layout[3] == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
     assert layout[6] == [f"layers.{4 * i + 3}.tail" for i in range(11)]
+    assert tail_group not in kv_cache_config.transfer_groups
 
     # Accounting charges exactly one extra shared block per request for the
     # tail, not a per-sequence allocation.
@@ -2423,6 +2431,7 @@ def test_glm5_dflash_draft_keeps_separate_kv_groups():
     assert len(extra_groups) == 1
     assert len(extra_groups[0].layer_names) == 5
     assert extra_groups[0].kv_cache_spec.block_size == 256
+    assert not extra_groups[0].enable_kv_transfer
     target_width = len(layout[2]) * layout[4] + len(layout[3]) * layout[5]
     assert kv_cache_utils._pool_bytes_per_block(groups) == target_width
 
@@ -2433,10 +2442,7 @@ def test_glm5_dflash_draft_keeps_separate_kv_groups():
     tensors = _tensor_by_layer(kv_cache_config)
     draft_tensors = [tensors[f"draft.layers.{i}.attn"] for i in range(5)]
     assert len({tensor.offset for tensor in draft_tensors}) == 5
-    target_tensors = [
-        tensors[name]
-        for name in [*layout[2], *layout[3]]
-    ]
+    target_tensors = [tensors[name] for name in [*layout[2], *layout[3]]]
     slot_pages: dict[int, list[tuple[int, int]]] = {}
     for draft_tensor in draft_tensors:
         target_tensor = next(
@@ -2447,9 +2453,11 @@ def test_glm5_dflash_draft_keeps_separate_kv_groups():
             < tensor.offset + tensor.block_stride
         )
         assert draft_tensor.block_stride == target_tensor.block_stride
-        page = extra_groups[0].kv_cache_spec.kv_cache_specs[
-            draft_tensor.layers[0]
-        ].page_size_bytes
+        page = (
+            extra_groups[0]
+            .kv_cache_spec.kv_cache_specs[draft_tensor.layers[0]]
+            .page_size_bytes
+        )
         suboffset = draft_tensor.offset - target_tensor.offset
         assert suboffset + page <= target_tensor.block_stride
         slot_pages.setdefault(target_tensor.offset, []).append(
@@ -2457,13 +2465,10 @@ def test_glm5_dflash_draft_keeps_separate_kv_groups():
         )
     for intervals in slot_pages.values():
         intervals.sort()
-        assert all(
-            left[1] <= right[0] for left, right in zip(intervals, intervals[1:])
-        )
+        assert all(left[1] <= right[0] for left, right in zip(intervals, intervals[1:]))
     assert {tensor.size for tensor in kv_cache_config.kv_cache_tensors} == {
         bytes_per_block * 100
     }
-
 
 
 def test_glm5_kpool_tail_does_not_drag_hash_block_size():

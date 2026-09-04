@@ -88,3 +88,11 @@ def test_prepare_values_rejects_unaligned_chunk():
     db = _make_db(4, 4)
     with pytest.raises(AssertionError):
         db.prepare_values([(0, BLOCK_SIZE + 1)], [0, 1])
+
+
+def test_prepare_values_rejects_multiblock_strided_region():
+    db = _make_db(1, 1)
+    db.set_block_strides([db.block_len[0] * 2])
+
+    with pytest.raises(ValueError, match="strided KV regions"):
+        db.prepare_values([(0, BLOCK_SIZE * 2)], [0, 1])

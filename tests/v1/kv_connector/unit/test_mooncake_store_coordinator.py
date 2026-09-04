@@ -15,9 +15,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 
@@ -109,6 +112,75 @@ def _hashes(n: int) -> list[BlockHash]:
 
 
 # ----- Single-group coordinator -----
+
+
+def test_glm_kpool_tail_is_excluded_before_coordinator_construction():
+    """GLM's request-private kpool tail is not a Mooncake transfer group."""
+    tail = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    groups = [
+        KVCacheGroupSpec(["mla"], _full(4352)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(4352)),
+        KVCacheGroupSpec(
+            ["tail"],
+            UniformTypeKVCacheSpecs(
+                block_size=4,
+                kv_cache_specs={"tail": tail},
+            ),
+            enable_kv_transfer=False,
+        ),
+    ]
+    config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    transfer_groups = list(config.transfer_groups)
+    assert transfer_groups == groups[:2]
+    coord = MooncakeStoreCoordinator(
+        transfer_groups,
+        scheduler_block_size=4352,
+        hash_block_size=256,
+    )
+    assert coord.kv_cache_groups == groups[:2]
+
+
+def test_glm_dflash_replays_one_target_block_from_external_hit():
+    """DFlash rebuilds private draft KV while target KV loads externally."""
+    groups = [KVCacheGroupSpec(["mla"], _full(4352))]
+    groups.extend(
+        KVCacheGroupSpec([f"mamba-{index}"], _mamba_align(4352)) for index in range(4)
+    )
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=4352,
+        hash_block_size=272,
+        use_eagle=True,
+        retention_interval=4352,
+    )
+    assert not coord.enable_partial_hash_hits
+    hashes = _hashes(8704 // 272)
+
+    store_masks = coord.store_mask(8704, num_prompt_tokens=8705)
+    assert all(mask is None for mask in store_masks)
+    exists: set[tuple[int, bytes]] = set()
+    for group_id, group in enumerate(groups):
+        group_hashes = coord.block_hashes_for_spec(hashes, group.kv_cache_spec)
+        exists.update((group_id, bytes(block_hash)) for block_hash in group_hashes)
+
+    _masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=8704,
+        cached_block_pool=ExternalCachedBlockPool(272, exists),
+    )
+    assert hit == 4352
 
 
 def test_coordinator_single_full_attention_all_hits():

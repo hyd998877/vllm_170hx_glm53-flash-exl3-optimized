@@ -117,6 +117,7 @@ def _make_store_recving_thread(
     *,
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
+    synchronize_after_load=None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -139,6 +140,7 @@ def _make_store_recving_thread(
         ready_event=threading.Event(),
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
+        synchronize_after_load=synchronize_after_load,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -1050,6 +1052,79 @@ def test_store_recving_thread_reports_failed_block_ids():
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
 
 
+def test_store_recving_thread_synchronizes_successful_gpu_load():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256]
+    synchronize_after_load = MagicMock()
+    thread = _make_store_recving_thread(
+        store, synchronize_after_load=synchronize_after_load
+    )
+
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1"], token_len=32))
+
+    synchronize_after_load.assert_called_once_with()
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+
+
+def test_store_recving_thread_synchronizes_partial_gpu_load():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -5]
+    synchronize_after_load = MagicMock()
+    thread = _make_store_recving_thread(
+        store, synchronize_after_load=synchronize_after_load
+    )
+
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1"], token_len=32))
+
+    synchronize_after_load.assert_called_once_with()
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1}
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+
+
+def test_store_recving_thread_does_not_publish_failure_before_fence():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -5]
+    fence_entered = threading.Event()
+    release_fence = threading.Event()
+
+    def blocking_fence():
+        fence_entered.set()
+        assert release_fence.wait(timeout=5)
+
+    recv_thread = _make_store_recving_thread(
+        store, synchronize_after_load=blocking_fence
+    )
+    handler = threading.Thread(
+        target=recv_thread._handle_request,
+        args=(_make_load_req("req-a", [b"a0", b"a1"], token_len=32),),
+    )
+    handler.start()
+    assert fence_entered.wait(timeout=5)
+
+    assert recv_thread.get_and_clear_block_ids_with_load_errors() == set()
+    assert recv_thread.get_and_clear_finished_requests() == set()
+
+    release_fence.set()
+    handler.join(timeout=5)
+    assert not handler.is_alive()
+    assert recv_thread.get_and_clear_block_ids_with_load_errors() == {1}
+    assert recv_thread.get_and_clear_finished_requests() == {"req-a"}
+
+
+def test_store_recving_thread_invalidates_entire_load_when_sync_fails():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256]
+    synchronize_after_load = MagicMock(side_effect=RuntimeError("fence failed"))
+    thread = _make_store_recving_thread(
+        store, synchronize_after_load=synchronize_after_load
+    )
+
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1"], token_len=32))
+
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+
+
 def test_store_recving_thread_reports_failed_block_ids_after_rotation():
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, -5, 256]
@@ -1591,7 +1666,7 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -2072,9 +2147,11 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
 
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = (
-        lambda keys, addrs, sizes, *_args: ([256] * len(keys))
-    )
+
+    def put_all(keys, *_args):
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put_all
 
     full_spec = FullAttentionSpec(
         block_size=32, num_kv_heads=8, head_size=64, dtype=None
@@ -2937,6 +3014,20 @@ def test_lookup_applies_swa_mask_before_accessing_hashes():
 # ---------------------------------------------------------------------------
 
 
+def test_coalesce_kv_regions_stays_inside_backing_allocation():
+    regions = [
+        (0x1000, 0x1000, 0x200, 0x100),
+        (0x2000, 0x1100, 0x200, 0x100),
+    ]
+
+    assert mooncake_store_worker._coalesce_kv_regions(regions) == regions
+
+
+def test_coalesce_kv_regions_rejects_copy_larger_than_stride():
+    with pytest.raises(ValueError, match="larger than its physical block stride"):
+        mooncake_store_worker._coalesce_kv_regions([(0x1000, 0x1000, 0x100, 0x101)])
+
+
 @pytest.mark.parametrize("save_decode_cache", [False, True])
 def test_consumer_starts_send_thread_only_when_put_is_enabled(save_decode_cache):
     num_blocks = 10
@@ -2990,7 +3081,7 @@ def test_register_kv_caches_shared_storage(layout: KVCacheLayout):
     )
 
     db = worker.token_dbs[0]
-    if not layout.is_block_compact:
+    if not layout.is_block_compact and layout is not KVCacheLayout.BHLNC:
         # Each head group is its own region, so a block spans L*H regions.
         head_cache = caches[0][:, 0]
         assert db.kv_caches_base_addr == [
@@ -3044,6 +3135,94 @@ def test_register_kv_caches_separate_head_groups():
     assert db.kv_caches_base_addr == expected_addrs
     assert db.block_len == [head_block_bytes] * len(expected_addrs)
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
+
+
+def test_register_kv_caches_isolates_transfer_group_regions():
+    """A group's object must not overwrite another group's physical block.
+
+    HMA groups have independent block tables. Giving every Mooncake key all
+    backing regions is only safe while their block IDs happen to be equal.
+    """
+    num_blocks = 4
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+        )
+        for group_id in range(2)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    _refresh_group_tp_replication_factors(worker)
+    raw = torch.zeros(num_blocks * 2 * spec.page_size_bytes, dtype=torch.int8)
+    views = dense_kv_cache_views(raw, spec, num_blocks, 2, KVCacheLayout.BLHNC)
+    caches = {"layer0": views[0], "layer1": views[1]}
+
+    _register_with_mocked_threads(worker, caches)
+
+    first, second = worker.token_dbs
+    assert first.kv_caches_base_addr == [caches["layer0"].data_ptr()]
+    assert first.block_len == [spec.page_size_bytes]
+    assert first.block_strides == [2 * spec.page_size_bytes]
+    assert second.kv_caches_base_addr == [caches["layer1"].data_ptr()]
+    assert second.block_len == [spec.page_size_bytes]
+    assert second.block_strides == [2 * spec.page_size_bytes]
+    assert set(first.kv_caches_base_addr).isdisjoint(second.kv_caches_base_addr)
+    # Distinct group block IDs must write disjoint layer pages even though the
+    # tensors share one block-outermost allocation.
+    first_addr = first.prepare_value(0, 16, [1])[0][0]
+    second_addr = second.prepare_value(0, 16, [2])[0][0]
+    assert first_addr + spec.page_size_bytes <= second_addr
+
+
+def test_register_kv_caches_skips_empty_projected_transfer_group():
+    num_blocks = 4
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec([], spec),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+        )
+        for group_id in range(2)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    _refresh_group_tp_replication_factors(worker)
+    cache = torch.zeros(num_blocks, spec.page_size_bytes, dtype=torch.int8)
+
+    _register_with_mocked_threads(worker, {"layer0": cache})
+
+    empty_db = worker.token_dbs[1]
+    assert empty_db.kv_caches_base_addr == []
+    assert empty_db.block_strides == []
+    assert empty_db.block_len == []
 
 
 # ---------------------------------------------------------------------------

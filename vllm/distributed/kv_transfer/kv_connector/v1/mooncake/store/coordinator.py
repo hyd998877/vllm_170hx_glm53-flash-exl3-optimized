@@ -83,7 +83,7 @@ class MooncakeStoreCoordinator:
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_groups, hash_block_size
+            kv_cache_groups, hash_block_size, use_eagle=use_eagle
         )
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
@@ -404,13 +404,20 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 
 def partial_hash_hits_enabled(
-    kv_cache_groups: list[KVCacheGroupSpec], hash_block_size: int
+    kv_cache_groups: list[KVCacheGroupSpec],
+    hash_block_size: int,
+    *,
+    use_eagle: bool = False,
 ) -> bool:
     """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``
     (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
     Single copy on purpose — scheduler and coordinator must not disagree.
     """
-    return any(
+    # EAGLE/DFlash must replay a full scheduler block to regenerate target
+    # hidden states and any non-transferred draft KV. A finer hit would also
+    # require a Mamba checkpoint at a hash-only boundary that sparse retention
+    # cannot represent.
+    return not use_eagle and any(
         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
         and spec.mamba_cache_mode == "align"
         and spec.block_size > hash_block_size

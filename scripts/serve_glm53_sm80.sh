@@ -21,6 +21,9 @@ CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-3,6,9,12,15,18}"
 ADAPTIVE_PREFILL="${ADAPTIVE_PREFILL:-1}"
 ADAPTIVE_PREFILL_MAX_TOKENS="${ADAPTIVE_PREFILL_MAX_TOKENS:-2048}"
 ADAPTIVE_PREFILL_BUSY_TOKENS="${ADAPTIVE_PREFILL_BUSY_TOKENS:-1550}"
+PREFIX_CACHING_HASH_ALGO="${PREFIX_CACHING_HASH_ALGO:-sha256}"
+MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-}"
+KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG:-}"
 EXTRA_ARGS=()
 DFLASH_BATCH_SCHEDULE_FIELD=""
 
@@ -62,6 +65,33 @@ esac
   exit 2
 }
 [[ -f "$CHAT_TEMPLATE" ]] || { echo "missing template: $CHAT_TEMPLATE" >&2; exit 2; }
+if [[ -n "$KV_TRANSFER_CONFIG" ]]; then
+  "$PYTHON_BIN" - "$KV_TRANSFER_CONFIG" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+if not isinstance(value, dict):
+    raise SystemExit("KV_TRANSFER_CONFIG must be a JSON object")
+if not value.get("kv_connector") or not value.get("kv_role"):
+    raise SystemExit("KV_TRANSFER_CONFIG requires kv_connector and kv_role")
+PY
+fi
+if [[ -n "${MOONCAKE_CONFIG_PATH:-}" ]]; then
+  [[ -f "$MOONCAKE_CONFIG_PATH" ]] || {
+    echo "missing Mooncake config: $MOONCAKE_CONFIG_PATH" >&2
+    exit 2
+  }
+  "$PYTHON_BIN" - "$MOONCAKE_CONFIG_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    value = json.load(config_file)
+if not isinstance(value, dict):
+    raise SystemExit("MOONCAKE_CONFIG_PATH must contain a JSON object")
+PY
+fi
 [[ -f "$EXL3_EXTENSION_DIR/exllamav3_ext.so" ]] || {
   echo "missing EXL3 extension: $EXL3_EXTENSION_DIR/exllamav3_ext.so" >&2
   echo "build it with scripts/build_exllamav3_ext.py" >&2
@@ -93,7 +123,22 @@ export VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS="$ADAPTIVE_PREFILL_MAX_TOKENS"
 export VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS="$ADAPTIVE_PREFILL_BUSY_TOKENS"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_USE_V2_MODEL_RUNNER=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+if [[ -n "$KV_TRANSFER_CONFIG" ]]; then
+  if [[ "${PYTORCH_CUDA_ALLOC_CONF:-}" == *"expandable_segments:True"* ]]; then
+    echo "KV connectors require stable CUDA virtual addresses; unset expandable_segments" >&2
+    exit 2
+  fi
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-backend:native}"
+else
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+fi
+
+if [[ -n "$KV_TRANSFER_CONFIG" ]]; then
+  EXTRA_ARGS+=(--kv-transfer-config "$KV_TRANSFER_CONFIG")
+fi
+if [[ -n "$MAMBA_CACHE_MODE" ]]; then
+  EXTRA_ARGS+=(--mamba-cache-mode "$MAMBA_CACHE_MODE")
+fi
 
 exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --served-model-name "$SERVED_MODEL" \
@@ -108,6 +153,7 @@ exec "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --block-size 256 \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.970}" \
   --kv-cache-dtype auto \
+  --prefix-caching-hash-algo "$PREFIX_CACHING_HASH_ALGO" \
   --trust-remote-code \
   --mm-processor-cache-gb 0 \
   --chat-template "$CHAT_TEMPLATE" \

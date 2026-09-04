@@ -683,3 +683,115 @@ KDA/Mamba hybrid state、top-k=2048、kpool=4、nextn=1 和 512-wide NoPE MLA。
 可复用的只有设计思想（flatten metadata、融合 Q/RoPE/quant、persistent workspace、
 调度计划缓存）。若要落地，必须写 GLM 专用 kernel，并先通过 token/state/KV layout
 正确性测试和 ≥10% kernel、≥2% 端到端 Amdahl 门禁；本轮不接入 V4 二进制路径。
+
+## 13. MooncakeStore 双实例前缀共享（2026-09-05）
+
+目标是两路相同 GLM 各占连续四卡（`0–3`、`4–7`，均 TP1/PP4），监听 3000/3001，
+通过一个本机 Mooncake master 共享已完成的相同 KV 前缀。该阶段不改变功耗、时钟、
+模型数值路径或正式单实例性能结论。
+
+### 13.1 冻结设计
+
+- Mooncake `embedded + tcp`，master `127.0.0.1:50051`，指标端口 50052。
+- 每个 PP worker 提供 4 GiB global segment 和 512 MiB local buffer；8 worker 的
+  CPU 内存上限约 36 GiB，不启用磁盘 offload。
+- 两路均为 `MooncakeStoreConnector / kv_both`，共享同一个带版本的
+  `cache_prefix`；固定 `PYTHONHASHSEED=20260905` 和 `sha256`。
+- 模型、served-model name、PP 分层 `13,12,11,9`、block size 256、KV auto、
+  DFlash2 k=2、multimodal profile 完全一致。
+- 混合 Mamba cache 固定为 align；GLM KPool tail 是 request-private scratch，继续
+  排除在 transfer groups 外。DFlash/EAGLE 的共享规则由已有 HMA coordinator
+  门禁覆盖。
+- 两路 lookup IPC 分配不同 `lookup_rpc_port`，且使用短的独立 Unix socket 目录；
+  Mooncake 模式关闭 `expandable_segments`，防止已注册 KV 虚拟地址被重映射。
+
+### 13.2 快速门禁与晋级顺序
+
+| 项目 | 验收条件 | 状态 |
+|---|---|---|
+| Mooncake/CUDA ABI | 模块、master 可加载，版本为 CUDA 13 build | **通过** |
+| HMA 定向回归 | worker + HMA E2E + prepare-values 全部通过；最终离线重跑六个 Mooncake 文件 | **146 passed；完整六文件 241 passed** |
+| 扩大回归 | Mooncake/HMA/core 扩大集合 | **293 passed；另 34 个在断言前因离线缺少 Hugging Face fixture checkpoint 未运行到功能验证** |
+| 资源账本 | 251 GiB RAM、`/dev/shm` 126 GiB、两组 GPU 组内 PIX | **通过** |
+| 安全启停 | 独立 PID/log/runtime，端口/GPU/PID fail-closed | **通过** |
+| 3000/3001 API | 两路 `/health`、model identity、512K 上限 | **通过** |
+| 文本/OCR/tool | 两路精确 `OK`、`Hello, AI world!`、forced `get_weather(Paris)` | **通过** |
+| A→B 8K | 8,705 tokens；命中 4,352；输出一致；0 failed keys | **通过；6.642 → 5.448 s** |
+| B→A 8K | 8,705 tokens；命中 4,352；输出一致；0 failed keys | **通过；3.564 → 2.380 s** |
+| 32K 双向 | 32,769 tokens；每向命中 26,112；0 failed keys | **通过；1.72× / 2.03×** |
+| 128K 双向 | 131,073 tokens；每向命中 126,208；输出一致 | **通过；11.01× / 10.80×** |
+
+启动时暴露出的两个部署问题已纳入脚本保护：Mooncake 与
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 不兼容；长 runtime 路径又会超过
+Linux `sockaddr_un.sun_path` 的 107 字节上限。前者改用 native allocator，后者改用
+每实例短路径。两次都发生在请求验证前，不能计为共享功能通过。
+
+启停入口共用同一把 `flock` 控制锁，并以 `/proc` starttime、PGID、SID、cmdline
+联合校验 PID 账本，防止并发启停、PID 复用或伪造 stale PID 导致误杀。下次干净
+启动后 master 的 RPC 和 metrics 仅监听 loopback；对外只开放 3000/3001 API。
+
+另有一个不属于本实验的 DeepSeek JIT audit 在 GLM worker 初始化窗口延迟占用
+GPU0–3，导致第一次 3000 启动因可用显存不足被 vLLM 拒绝。脚本已增加对“尚未占用
+显存、但环境声明会使用目标 GPU”的重叠 vLLM 预检；未知进程只报告，不终止。
+
+服务级验证严格按 `8,705 → 32,769 → 131,073` 晋级，即 8K/32K/128K 目标各加
+1 token。Mooncake 只保存其中完整的 4,352-token transfer chunks，余数作为本地
+重算后缀，确保能同时验证外部命中与后缀衔接。
+每个长度先用唯一前缀测真冷 producer，再等待“完整 chunk 数 × PP4”的
+`save_exists`/`save_put` 任务全部排空，最后在 peer 请求相同 token IDs；反向
+使用另一唯一前缀。DFlash 需重放一个 4,352-token target block 来重建未传输的
+draft KV，所以 8,705-token 用例的正确最小外部命中是 4,352，不是 7,936。
+
+### 13.3 长上下文故障根因与修复
+
+早期实现把每个 HMA cache group 的 Mooncake object 都指向该 PP rank 的全部 KV
+backing regions。这在短请求中会被“各 group 恰好使用相同 block ID”掩盖；
+长上下文中各 group 的 block table 分化后，某个 group 的 GET 会覆盖其他 group
+对应 region，造成 128K 输出错误。修复后每个 transfer group 只登记并传输自己
+的 layer regions，分开记录物理 `block_stride` 和真实 `copy_size`，底层 backing
+allocation 仍只向 Mooncake 注册一次。
+
+region 顺序不依赖裸 CUDA 地址，而按稳定的 backing-storage 发现顺序和 storage 内
+offset 排列；只合并同一 allocation 内真正相邻、stride 相同且合并后不超过物理
+block stride 的 region。当前 PP rank 没有 layer 的 projected 空 group 直接标记为
+不参与传输。DFlash draft KV 和 KPool tail 均保持 request-private，不进入外部 group。
+
+另外，完成 GET 后必须在实际 KV tensor 所在 GPU 做可见性同步，然后才向
+scheduler 发布 load 完成；partial GET 和 GET 异常后的潜在部分写入也必须先 fence。
+该 `load_sync` 在 128K 热态中每个 PP rank 平均约
+0.1–0.3 ms，相对 3.3 s 跨实例响应可忽略，不应删除。验证器也从“看到
+首个 PUT 就开始 peer load”修正为等待全部 PP save 任务排空，避免只命中
+部分已写完前缀的竞态。若 GET 或 GPU fence 抛出异常，整次请求涉及的 block IDs
+全部失效，不能只失效最后一个 disk-split 子批，否则早先直接写入的 KV 也可能被
+scheduler 错误复用。
+
+EngineCore 的 invalid-block 恢复也已扩展到 HMA：BlockPool 的 ID 在同一 engine 内
+跨 group 唯一，因此 scheduler 可把错误 ID 映射回 group 的 token 位置，向下取整到
+所有 group 共用的 LCM scheduling 边界，并驱逐每个可缓存 group 的依赖后缀。映射
+使用 cache manager 的 effective block size，覆盖 DCP 对 attention block 的放大。
+错误 ID 只会在 device fence 完成后原子发布，避免主线程提前 free/reuse DMA 尚在写的
+block；阻塞 fence 并发门禁与完整 KV-load failure 套件均已覆盖（19 passed）。
+
+### 13.4 正式结果
+
+| prompt | 外部命中 | A→B 冷/共享 | B→A 冷/共享 | 正确性 |
+|---:|---:|---:|---:|---|
+| 8,705 | 4,352 | 6.642 / 5.448 s | 3.564 / 2.380 s | 首 token 和完整输出一致 |
+| 32,769 | 26,112 | 16.793 / 9.783 s | 9.376 / 4.611 s | 首 token 和完整输出一致 |
+| 131,073 | 126,208 | 35.920 / 3.262 s | 35.687 / 3.304 s | 首 token 和完整输出一致 |
+
+128K 每个方向均有 600 save keys、132 load keys、0 failed keys，A→B 加速
+11.01×，B→A 加速 10.80×。group 隔离后每方向的保存量由旧实现的
+9.596 GB 降至 6.047 GB，加载量由 2.111 GB 降至 1.618 GB。正式 JSON 证据位于
+`runtime/mooncake-dual-pp4/isolated-final-8705.json`、`isolated-32769.json` 和
+`isolated-formal-131073.json`。验证后 master 使用约 21.77/34.36 GB，失败计数为 0。
+严格验证器的补充 8,705-token 结果位于 `strict-final-8705.json`，A→B 为
+3.199 → 2.418 s、B→A 为 3.186 → 2.413 s，`passed=true`。
+这些是重用已存前缀的端到端耗时，不代表新前缀的 prefill 吞吐提高。
+
+上述容错补丁全部加载并干净重启后的最终复验同样通过：热态 8,705-token
+A→B 为 3.171 → 2.383 s（1.33×），B→A 为 3.149 → 2.358 s（1.34×）；
+131,073-token A→B 为 35.755 → 3.511 s（10.18×），B→A 为
+35.441 → 3.283 s（10.80×）。128K 每方向仍精确命中 126,208 tokens、加载
+132 keys、0 failed keys，完整 8-token 输出和首 token 一致。证据为
+`strict-warm-post-fix-8705.json` 与 `strict-post-fix-131073.json`。

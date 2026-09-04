@@ -75,8 +75,16 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        use_eagle = bool(
+            spec_cfg.use_eagle()
+            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
+            else False
+        )
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_config.kv_cache_groups, self._hash_block_size
+            list(kv_cache_config.transfer_groups),
+            self._hash_block_size,
+            use_eagle=use_eagle,
         )
 
         # Per-request state

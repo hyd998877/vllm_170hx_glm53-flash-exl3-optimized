@@ -238,6 +238,102 @@ Graph warmup，通常需要数分钟。看到 `Application startup complete` 后
 `text-benchmark` 会等待六个大 prompt 形成 cohort。不要把它用于普通单请求服务，
 否则单个请求可能长时间停留在 Waiting。生产 profile 默认 barrier=0。
 
+### 双实例 MooncakeStore 前缀共享（第二阶段已验证）
+
+当 8 张卡同时可用时，可以运行两个相同的 TP1/PP4 GLM 实例，并让已完成的公共
+前缀通过 MooncakeStore 在实例间复用：
+
+| 实例 | GPU | API |
+|---|---|---|
+| A | `0,1,2,3` | `0.0.0.0:3000` |
+| B | `4,5,6,7` | `0.0.0.0:3001` |
+| Mooncake master | CPU | `127.0.0.1:50051`；指标 `50052` |
+
+先安装与 CUDA 13 匹配的包：
+
+```bash
+uv pip install mooncake-transfer-engine-cuda13==0.3.13.post1 msgpack==1.2.2
+```
+
+本机部署入口位于 NVMe 根目录：
+
+```bash
+/mnt/nvme0/start_glm53_dual_mooncake.sh
+/mnt/nvme0/status_glm53_dual_mooncake.sh
+/mnt/nvme0/stop_glm53_dual_mooncake.sh
+```
+
+仓库内对应入口是 `scripts/start_glm53_dual_mooncake.sh`、
+`scripts/status_glm53_dual_mooncake.sh` 和
+`scripts/stop_glm53_dual_mooncake.sh`。启动器先启动 master，再顺序加载两路，
+并对端口、PID、GPU 占用 fail-closed；不会终止身份不匹配的进程。只有一组 GPU
+空闲时可用 `--only-3000` 或 `--only-3001` 分步启动。
+
+start/stop 共用同一把 `flock` 控制锁。托管身份同时校验 `/proc` starttime、PGID、
+SID 和 cmdline，因此并发启停、PID 复用及伪造 stale PID 都会 fail-closed。master
+RPC/metrics 只绑定 `127.0.0.1`，API 3000/3001 才监听内网地址。
+
+当前 `configs/mooncake_store_dual_pp4.json` 使用同机 TCP、每个 PP worker 4 GiB
+共享 segment 和 512 MiB 本地操作 buffer。两路共 8 个 worker，CPU 池上限约
+32 GiB，本地 buffer 上限约 4 GiB。两实例固定使用相同的模型、PP 分层、block
+size、KV dtype、DFlash 配置、`cache_prefix`、`PYTHONHASHSEED` 和 SHA-256 prefix
+hash；lookup IPC 则必须使用不同身份，避免两个 engine 在同机冲突。KV connector
+还要求稳定的 CUDA 虚拟地址，所以该 profile 使用原生 PyTorch allocator，不启用
+`expandable_segments`。
+
+双向共享门禁从 8K/32K/128K 目标各增加 1 token；Mooncake 只保存完整的
+4,352-token transfer chunks，剩余部分用于验证本地重算后缀的衔接：
+
+```bash
+/mnt/nvme0/keys-vllm-glm53/.venv/bin/python \
+  scripts/verify_glm53_mooncake_sharing.py --tokens 8705
+```
+
+门禁为 A→B 和 B→A 分别创建唯一前缀，比较确定性输出，并要求接收端
+`vllm:external_prefix_cache_hits_total` 至少命中可安全重用的完整前缀。DFlash 需重放
+一个 4,352-token target block 重建未传输的 draft KV，因此 8,705-token 用例的
+正确最小命中是 4,352 tokens。同时保存
+Mooncake save/lookup/load 的 calls、keys、bytes 和耗时指标到
+`runtime/mooncake-dual-pp4/sharing-result.json`。8K 通过后再用 `--tokens 32769`，
+最后才运行昂贵的 `--tokens 131073`。
+
+第二阶段正式结果：
+
+| prompt | 外部命中 | A→B 冷/共享 | B→A 冷/共享 |
+|---:|---:|---:|---:|
+| 8,705 | 4,352 | 6.642 / 5.448 s | 3.564 / 2.380 s |
+| 32,769 | 26,112 | 16.793 / 9.783 s | 9.376 / 4.611 s |
+| 131,073 | 126,208 | 35.920 / 3.262 s（11.01×） | 35.687 / 3.304 s（10.80×） |
+
+最终容错补丁加载并干净重启后的复验结果：
+
+| prompt | 外部命中 | A→B 冷/共享 | B→A 冷/共享 |
+|---:|---:|---:|---:|
+| 8,705 | 4,352 | 3.171 / 2.383 s（1.33×） | 3.149 / 2.358 s（1.34×） |
+| 131,073 | 126,208 | 35.755 / 3.511 s（10.18×） | 35.441 / 3.283 s（10.80×） |
+
+对应证据是 runtime 目录中的 `strict-warm-post-fix-8705.json` 和
+`strict-post-fix-131073.json`；两者均为 `passed=true`。
+
+三档均完成双向验证，首 token 和完整 8-token 输出一致，Mooncake failed
+keys 为 0。修复的根因是 HMA 各 cache group 拥有独立 block table，旧实现却让
+每个 group 都搬运该 PP rank 的全部 backing regions；长上下文的 group block ID
+分化后会相互覆盖。现在每个 transfer group 只传输它自己的 layer regions，
+region 使用稳定的 storage/offset 顺序且不会跨 allocation 错误合并，并在直接写入
+GPU 后做可见性同步，再向 scheduler 发布完成；partial GET 也会先 fence 已成功写入
+的 buffers。若传输或同步异常，整次请求的相关 block IDs 都会失效，EngineCore 会
+按 HMA group 的 token 位置回退到共同 scheduling 边界，并逐组驱逐依赖后缀。定向
+worker/HMA/prepare-values 定向回归为 146 passed；最终离线重跑完整的
+connector/coordinator/scheduler/worker/HMA/prepare-values 六文件集合为 241 passed；
+KV-load failure 四文件套件为 19 passed；扩大离线集合为 293 passed，另有 34 个在
+功能断言前因缺少 Hugging Face fixture checkpoint 无法初始化，不计为 Mooncake
+功能失败或通过。
+
+这不是合并两路 GPU KV 池：每个实例仍有自己的 GPU KV，Mooncake 只复用已写入
+CPU store 的相同 block 前缀。因此全新请求的首次 prefill 不会变快；收益来自另一
+实例随后收到完全相同的长前缀，并需要支付一次保存和一次 CPU↔GPU 传输成本。
+不同租户不要共用 `cache_prefix`；仅改 prefix 是命名空间隔离，不等价于鉴权。
+
 `--max-model-len=524288` 表示单请求允许的长度上限，不代表 KV cache 能同时驻留
 六个 512K 请求。默认容量和调度目标是六路 128K。
 
@@ -314,6 +410,9 @@ cache 单元测试。GPU kernel 测试依赖 SM80/CUDA 环境，不适合在普�
 | `vllm/v1/attention/` | SM80 sparse MLA、kpool、DFlash 与 attention 修改 |
 | `vllm/v1/core/sched/` | PP phase/pairpack/cohort 调度修改 |
 | `scripts/serve_glm53_sm80.sh` | 可移植的三 profile 启动脚本 |
+| `scripts/*glm53_dual_mooncake*` | 双 PP4 实例的 MooncakeStore 安全启停与状态检查 |
+| `scripts/verify_glm53_mooncake_sharing.py` | A→B/B→A 外部 KV 命中和输出一致性门禁 |
+| `configs/mooncake_store_dual_pp4.json` | 同机 CPU store 的 Mooncake 配置 |
 | `scripts/build_exllamav3_ext.py` | stock/experimental EXL3 native extension builder |
 | `scripts/convert_exl3_to_marlin.py` | 逐层生成 Marlin INT4 sidecar |
 | `chat_templates/` | 支持视觉、工具调用和 thinking switch 的模板 |

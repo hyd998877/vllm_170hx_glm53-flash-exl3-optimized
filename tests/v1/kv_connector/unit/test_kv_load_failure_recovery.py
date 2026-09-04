@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,93 @@ from .utils import (
     create_scheduler,
     create_vllm_config,
 )
+
+
+def test_hybrid_load_failure_rewinds_and_evicts_every_cache_group():
+    cache_groups = [
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(
+                block_size=4, participates_in_prefix_caching=True
+            )
+        ),
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(
+                block_size=8, participates_in_prefix_caching=True
+            )
+        ),
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(
+                block_size=4, participates_in_prefix_caching=False
+            )
+        ),
+    ]
+    block_ids = (
+        list(range(10, 22)),
+        list(range(30, 36)),
+        list(range(50, 62)),
+    )
+    kv_cache_manager = SimpleNamespace(
+        get_block_ids=Mock(return_value=block_ids),
+        block_pool=SimpleNamespace(null_block=SimpleNamespace(block_id=0)),
+        coordinator=SimpleNamespace(
+            single_type_managers=tuple(
+                SimpleNamespace(block_size=size) for size in (4, 8, 4)
+            )
+        ),
+    )
+    scheduler = SimpleNamespace(
+        block_size=16,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=cache_groups),
+        kv_cache_manager=kv_cache_manager,
+    )
+    request = SimpleNamespace(request_id="hybrid", num_computed_tokens=48)
+
+    affected, affected_tokens, blocks_to_evict = (
+        Scheduler._update_requests_with_invalid_blocks(
+            scheduler,
+            [request],
+            # Group 0 block 15 begins at token 20, inside scheduler block 16.
+            {15},
+            {},
+        )
+    )
+
+    assert affected == {"hybrid"}
+    assert affected_tokens == 32
+    assert request.num_computed_tokens == 16
+    assert blocks_to_evict == set(range(14, 22)) | set(range(32, 36))
+
+
+def test_hybrid_load_failure_uses_dcp_effective_manager_block_size():
+    group = SimpleNamespace(
+        kv_cache_spec=SimpleNamespace(
+            # DCP2 doubles this to the manager's effective 32-token block.
+            block_size=16,
+            participates_in_prefix_caching=True,
+        )
+    )
+    kv_cache_manager = SimpleNamespace(
+        get_block_ids=Mock(return_value=([10, 11],)),
+        block_pool=SimpleNamespace(null_block=SimpleNamespace(block_id=0)),
+        coordinator=SimpleNamespace(
+            single_type_managers=(SimpleNamespace(block_size=32),)
+        ),
+    )
+    scheduler = SimpleNamespace(
+        block_size=32,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[group]),
+        kv_cache_manager=kv_cache_manager,
+    )
+    request = SimpleNamespace(request_id="dcp2", num_computed_tokens=64)
+
+    affected, affected_tokens, blocks_to_evict = (
+        Scheduler._update_requests_with_invalid_blocks(scheduler, [request], {11}, {})
+    )
+
+    assert affected == {"dcp2"}
+    assert affected_tokens == 32
+    assert request.num_computed_tokens == 32
+    assert blocks_to_evict == {11}
 
 
 def _make_get_num_new_matched_tokens(

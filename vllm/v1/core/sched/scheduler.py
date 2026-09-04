@@ -961,9 +961,7 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                if self._should_defer_waiting_prefill(
-                    request, num_computed_tokens
-                ):
+                if self._should_defer_waiting_prefill(request, num_computed_tokens):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -3001,56 +2999,60 @@ class Scheduler(SchedulerInterface):
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
         for request in requests:
-            is_affected = False
-            marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
+            group_managers = self.kv_cache_manager.coordinator.single_type_managers
+            expected_group_count = len(self.kv_cache_config.kv_cache_groups)
+            if (
+                len(req_block_ids_by_group) != expected_group_count
+                or len(group_managers) != expected_group_count
+            ):
+                raise RuntimeError(
+                    "KV cache block group count changed while handling a load "
+                    f"failure for request {req_id}: "
+                    f"blocks={len(req_block_ids_by_group)}, "
+                    f"managers={len(group_managers)}, "
+                    f"specs={expected_group_count}"
+                )
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
-
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            invalid_positions: list[tuple[int, int]] = []
+            for manager, req_block_ids in zip(
+                group_managers,
+                req_block_ids_by_group,
+                strict=True,
+            ):
+                # The manager size includes effective DCP scaling; the raw
+                # AttentionSpec size does not.
+                group_block_size = manager.block_size
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + group_block_size - 1
+                ) // group_block_size
+                invalid_positions.extend(
+                    (idx * group_block_size, block_id)
+                    for idx, block_id in enumerate(
+                        req_block_ids[:req_num_computed_blocks]
+                    )
+                    if block_id in invalid_block_ids
                 )
-                total_affected_tokens += num_affected_tokens
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+            if invalid_positions:
+                # Block IDs come from one engine-wide BlockPool and are unique
+                # across HMA groups. Preserve the existing shared-block rule,
+                # but compute the earliest new failure in token coordinates.
+                new_invalid_positions = [
+                    (token_position, block_id)
+                    for token_position, block_id in invalid_positions
+                    if block_id not in marked_invalid_block_ids
+                ]
+                marked_invalid_block_ids.update(
+                    block_id for _, block_id in invalid_positions
+                )
 
-            if is_affected:
-                if not marked_invalid_block:
+                if not new_invalid_positions:
                     # All invalid blocks of this request are shared with
                     # previous requests and will be recomputed by them.
                     # Revert to considering only cached tokens as computed.
@@ -3060,7 +3062,41 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - req_num_computed_tokens
                     )
                     request.num_computed_tokens = req_num_computed_tokens
+                else:
+                    first_invalid_token = min(
+                        token_position for token_position, _ in new_invalid_positions
+                    )
+                    # Scheduling and cross-group dependency boundaries are the
+                    # LCM block size. If a smaller HMA group reports the error,
+                    # rewind to the containing scheduler block so every group
+                    # is recomputed from a mutually valid boundary.
+                    recompute_from = (
+                        first_invalid_token // self.block_size * self.block_size
+                    )
+                    request.num_computed_tokens = recompute_from
+                    total_affected_tokens += req_num_computed_tokens - recompute_from
 
+                    if evict_blocks:
+                        null_block_id = (
+                            self.kv_cache_manager.block_pool.null_block.block_id
+                        )
+                        # A failed layer invalidates the model state from this
+                        # token onward, not just the reporting HMA group. Evict
+                        # every cacheable group's dependent suffix.
+                        for group, manager, req_block_ids in zip(
+                            self.kv_cache_config.kv_cache_groups,
+                            group_managers,
+                            req_block_ids_by_group,
+                            strict=True,
+                        ):
+                            if not group.kv_cache_spec.participates_in_prefix_caching:
+                                continue
+                            start_idx = recompute_from // manager.block_size
+                            blocks_to_evict.update(
+                                block_id
+                                for block_id in req_block_ids[start_idx:]
+                                if block_id != null_block_id
+                            )
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict

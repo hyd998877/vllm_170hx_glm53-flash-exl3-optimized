@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal, TypeVar
 
 import regex as re
@@ -90,6 +91,34 @@ _T = TypeVar("_T")
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
+
+
+def _coalesce_kv_regions(
+    regions: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Coalesce adjacent pages without crossing an allocation or block."""
+    merged: list[tuple[int, int, int, int]] = []
+    for storage_addr, base_addr, block_stride, copy_size in regions:
+        if (
+            merged
+            and merged[-1][0] == storage_addr
+            and merged[-1][2] == block_stride
+            and merged[-1][1] + merged[-1][3] == base_addr
+        ):
+            prev_storage, prev_base, prev_stride, prev_size = merged[-1]
+            merged[-1] = (
+                prev_storage,
+                prev_base,
+                prev_stride,
+                prev_size + copy_size,
+            )
+        else:
+            merged.append((storage_addr, base_addr, block_stride, copy_size))
+        if merged[-1][3] > merged[-1][2]:
+            raise ValueError(
+                "Mooncake transfer region is larger than its physical block stride"
+            )
+    return merged
 
 
 def _replicate_config_supports_group_ids(
@@ -888,10 +917,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             kv_event_block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
-                if (
-                    not self.group_participates[g_idx]
-                    or db.block_size < self.block_size
-                ):
+                if not self.group_participates[g_idx]:
                     continue
                 # Rotate the stride phase per group to balance load across ranks.
                 put_step = self.group_put_steps[g_idx]
@@ -1147,6 +1173,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
+        synchronize_after_load: Callable[[], None] | None = None,
     ):
         super().__init__(
             store,
@@ -1175,6 +1202,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        # Mooncake may complete a direct-to-GPU transfer on a CUDA stream
+        # outside PyTorch. Do not publish the request back to the scheduler
+        # until those writes are visible to model execution. Without this
+        # fence, a long cross-instance prefix can very rarely decode from a
+        # partially visible last chunk.
+        self.synchronize_after_load = synchronize_after_load
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1222,6 +1255,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
+
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
@@ -1277,12 +1315,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
-        current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_start = time.perf_counter()
+        unsafe_block_ids: set[int] = set()
         try:
-            for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
+            for batch_index, (
+                batch_keys,
+                batch_addrs,
+                batch_sizes,
+                batch_block_ids,
+            ) in enumerate(load_batches):
                 current_batch_keys = batch_keys
-                current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1312,8 +1355,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
-                    self._add_load_error_block_ids(
-                        [block_id for _, _, block_id in failed]
+                    # Disk-offload splitting stops at the first failing
+                    # sub-batch. Report its failed blocks plus every later,
+                    # unattempted sub-batch so recompute mode never consumes
+                    # an external block that was not loaded.
+                    unsafe_block_ids.update(block_id for _, _, block_id in failed)
+                    unsafe_block_ids.update(
+                        block_id
+                        for _, _, _, remaining_block_ids in load_batches[
+                            batch_index + 1 :
+                        ]
+                        for block_id in remaining_block_ids
                     )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
@@ -1324,7 +1376,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
-            self._add_load_error_block_ids(current_batch_block_ids)
+            # A transfer exception can follow partial direct writes, so every
+            # attempted request block is unsafe until the fence below completes.
+            unsafe_block_ids.update(block_id_list_c)
             self._record_operation(
                 "load_get",
                 load_get_start,
@@ -1338,6 +1392,36 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys[:3],
                 e,
             )
+        finally:
+            # A partial result (or a store exception after partial progress)
+            # can still have written successful GPU buffers. Fence those writes
+            # before reporting either completion or invalid IDs to scheduler.
+            if self.synchronize_after_load is not None:
+                sync_start = time.perf_counter()
+                try:
+                    self.synchronize_after_load()
+                except Exception as e:
+                    unsafe_block_ids.update(block_id_list_c)
+                    self._record_operation(
+                        "load_sync",
+                        sync_start,
+                        0,
+                        status="error",
+                        num_failed_keys=len(block_id_list_c),
+                    )
+                    logger.warning(
+                        "Failed to synchronize Mooncake load for request %s: %s",
+                        req_id,
+                        e,
+                    )
+                else:
+                    self._record_operation("load_sync", sync_start, 0)
+
+            # Publish failures only after the device fence has completed (or
+            # itself failed). Otherwise EngineCore could free and reuse a block
+            # while Mooncake DMA is still writing it.
+            if unsafe_block_ids:
+                self._add_load_error_block_ids(list(unsafe_block_ids))
 
         self.set_finished_request(req_id)
         self.request_queue.task_done()
@@ -1655,10 +1739,8 @@ class MooncakeStoreWorker:
         self.num_blocks = self.cache_config.num_gpu_blocks
 
         seen_storage_ptrs: set[int] = set()
-        seen_region_ptrs: set[int] = set()
-        addrs: list[int] = []
-        block_lens: list[int] = []
-
+        # Register each backing allocation once. Object values below use
+        # group-specific subregions within these registered allocations.
         for cache in kv_caches.values():
             cache = group_kernel_blocks(cache, self.num_blocks)
             cache_storage = cache.untyped_storage()
@@ -1676,48 +1758,86 @@ class MooncakeStoreWorker:
                         ret,
                     )
 
-            if not is_non_overlapping_and_dense(cache[0]):
-                # A block is scattered across per-head regions; each region's
-                # blocks are contiguous.
-                for head_idx in range(cache.shape[1]):
-                    head_cache = cache[:, head_idx]
-                    assert is_non_overlapping_and_dense(head_cache[0])
-                    region_addr = head_cache.data_ptr()
-                    if region_addr in seen_region_ptrs:
-                        continue
-                    seen_region_ptrs.add(region_addr)
-                    addrs.append(region_addr)
-                    block_lens.append(head_cache.stride(0) * head_cache.element_size())
-            elif cache.stride(0) * cache.element_size() * self.num_blocks == region_len:
-                # The block stride spans the whole per-block window
-                # (block-outermost and packed layouts, and single-layer
-                # tensors), which may hold other layers' pages at higher
-                # offsets. Register the storage once as one whole-window
-                # region; per-layer regions would copy overlapping windows and
-                # run past the storage for offset layers.
-                if base_addr in seen_region_ptrs:
+        total_regions = 0
+        for group, db in zip(self._kv_cache_groups, self.token_dbs, strict=True):
+            # (backing allocation, block-0 address, block stride, copy size)
+            regions: dict[tuple[int, int, int, int], None] = {}
+            storage_order: dict[int, int] = {}
+
+            for layer_name in group.layer_names:
+                layer_cache = kv_caches.get(layer_name)
+                if layer_cache is None:
                     continue
-                seen_region_ptrs.add(base_addr)
-                addrs.append(base_addr)
-                block_lens.append(region_len // self.num_blocks)
-            else:
-                region_addr = cache.data_ptr()
-                if region_addr in seen_region_ptrs:
-                    continue
-                seen_region_ptrs.add(region_addr)
-                addrs.append(region_addr)
-                block_lens.append(cache.stride(0) * cache.element_size())
+                cache = group_kernel_blocks(layer_cache, self.num_blocks)
+                storage_addr = cache.untyped_storage().data_ptr()
+                storage_order.setdefault(storage_addr, len(storage_order))
+                if not is_non_overlapping_and_dense(cache[0]):
+                    # Some layouts scatter a layer block across head regions.
+                    for head_idx in range(cache.shape[1]):
+                        head_cache = cache[:, head_idx]
+                        assert is_non_overlapping_and_dense(head_cache[0])
+                        regions.setdefault(
+                            (
+                                storage_addr,
+                                head_cache.data_ptr(),
+                                head_cache.stride(0) * head_cache.element_size(),
+                                head_cache[0].numel() * head_cache.element_size(),
+                            )
+                        )
+                else:
+                    regions.setdefault(
+                        (
+                            storage_addr,
+                            cache.data_ptr(),
+                            cache.stride(0) * cache.element_size(),
+                            cache[0].numel() * cache.element_size(),
+                        )
+                    )
+
+            if not regions:
+                db.set_kv_caches_base_addr([])
+                db.set_block_strides([])
+                db.set_block_len([])
+                logger.info(
+                    "Skipping empty Mooncake transfer group %d on PP rank %d",
+                    db.metadata.group_id,
+                    db.metadata.pp_rank,
+                )
+                continue
+
+            # Coalesce exactly adjacent pages with an identical block stride.
+            # This keeps block-outermost groups efficient without copying gaps
+            # that belong to another overlaid HMA group.
+            ordered_regions = sorted(
+                regions,
+                key=lambda region: (
+                    storage_order[region[0]],
+                    region[1] - region[0],
+                ),
+            )
+            merged = _coalesce_kv_regions(ordered_regions)
+
+            db.set_kv_caches_base_addr([region[1] for region in merged])
+            db.set_block_strides([region[2] for region in merged])
+            db.set_block_len([region[3] for region in merged])
+            total_regions += len(merged)
+            logger.info(
+                "Registered Mooncake transfer group %d: layers=%d, "
+                "regions=%d, bytes_per_block=%d",
+                db.metadata.group_id,
+                len(group.layer_names),
+                len(merged),
+                sum(region[3] for region in merged),
+            )
 
         logger.info(
-            "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
+            "Registered KV caches: num_groups=%d, group_regions=%d, "
+            "backing_allocations=%d, num_blocks=%d",
             len(self.token_dbs),
-            len(addrs),
+            total_regions,
+            len(seen_storage_ptrs),
             self.num_blocks,
         )
-
-        for db in self.token_dbs:
-            db.set_kv_caches_base_addr(addrs)
-            db.set_block_len(block_lens)
 
         # Start transfer threads
         if self.can_put:
@@ -1737,7 +1857,8 @@ class MooncakeStoreWorker:
                 supports_group_ids=self._supports_group_ids,
                 record_operation=self._record_kv_connector_operation,
                 group_participates=[
-                    group.kv_cache_spec.participates_in_prefix_caching
+                    bool(group.layer_names)
+                    and group.kv_cache_spec.participates_in_prefix_caching
                     for group in self._kv_cache_groups
                 ],
             )
@@ -1745,6 +1866,7 @@ class MooncakeStoreWorker:
 
         self.kv_recv_threads = []
         ready_events_recving = []
+        load_device = next(iter(kv_caches.values())).device
         for i in range(self.num_recv_threads):
             ready_event_recving = threading.Event()
             recv_thread = KVCacheStoreRecvingThread(
@@ -1758,9 +1880,13 @@ class MooncakeStoreWorker:
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
                 group_participates=[
-                    group.kv_cache_spec.participates_in_prefix_caching
+                    bool(group.layer_names)
+                    and group.kv_cache_spec.participates_in_prefix_caching
                     for group in self._kv_cache_groups
                 ],
+                synchronize_after_load=partial(
+                    torch.accelerator.synchronize, load_device
+                ),
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1928,15 +2054,12 @@ class MooncakeStoreWorker:
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
-        fine_grained = False
+        fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
-            if (
-                not self._kv_cache_groups[
-                    g_idx
-                ].kv_cache_spec.participates_in_prefix_caching
-                or db.block_size < self.block_size
-            ):
+            if not self._kv_cache_groups[
+                g_idx
+            ].kv_cache_spec.participates_in_prefix_caching:
                 continue
             spec_block_size = db.block_size
             key_prefixes = self._lookup_key_prefixes[g_idx]

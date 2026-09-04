@@ -1128,6 +1128,7 @@ def _get_kv_cache_groups_glm5_next(
         return None
 
     mla_specs = cast(dict[str, MLAAttentionSpec], mla_specs)
+
     def is_indexer(name: str, spec: MLAAttentionSpec) -> bool:
         # Hopper kpool indexers are identified by compression ratio > 1.
         # Ampere stores one index entry per token, so use the layer name plus
@@ -1185,7 +1186,8 @@ def _get_kv_cache_groups_glm5_next(
             (
                 candidate
                 for candidate in range(target_block_size, 15, -1)
-                if target_block_size % candidate == 0 and candidate % 16 == 0
+                if target_block_size % candidate == 0
+                and candidate % 16 == 0
                 and _pages_fit_storage_slots(
                     [
                         spec.page_size_bytes * candidate // spec.block_size
@@ -1204,7 +1206,17 @@ def _get_kv_cache_groups_glm5_next(
         }
         resized_uniform = UniformTypeKVCacheSpecs.from_specs(resized_extra_specs)
         assert resized_uniform is not None
-        extra_groups.append(KVCacheGroupSpec(list(extra_specs), resized_uniform))
+        # DFlash is hosted only on the final PP stage. Its sliding-window KV is
+        # rebuilt from the target hidden states in the EAGLE replay block, so it
+        # must not become a cross-instance transfer group whose namespace would
+        # incorrectly require a value from every PP stage.
+        extra_groups.append(
+            KVCacheGroupSpec(
+                list(extra_specs),
+                resized_uniform,
+                enable_kv_transfer=False,
+            )
+        )
 
     tail_group: KVCacheGroupSpec | None = None
     if tail_specs:
@@ -1215,7 +1227,11 @@ def _get_kv_cache_groups_glm5_next(
         }
         tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
         assert tail_uniform is not None
-        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+        tail_group = KVCacheGroupSpec(
+            list(padded_tail_specs),
+            tail_uniform,
+            enable_kv_transfer=False,
+        )
 
     any_mamba = next(iter(mamba_specs.values()))
     assert all(spec == any_mamba for spec in mamba_specs.values())
@@ -1589,9 +1605,7 @@ def _glm5_extra_slot_layout(
     extra_groups: list[KVCacheGroupSpec],
 ) -> list[dict[str, tuple[int, int, int]]] | None:
     """Assign each extra-group layer to a target layer-major storage slot."""
-    slots = [
-        (index * mla_page, mla_page) for index in range(len(mla_names))
-    ] + [
+    slots = [(index * mla_page, mla_page) for index in range(len(mla_names))] + [
         (len(mla_names) * mla_page + index * idx_page, idx_page)
         for index in range(len(idx_names))
     ]
@@ -1633,9 +1647,7 @@ def _get_kv_cache_bytes_per_block(
 ) -> int:
     """Return the largest cache group's bytes per block."""
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _, extra_groups = (
-            glm5_layout
-        )
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, extra_groups = glm5_layout
         target_width = len(mla_names) * mla_page + len(idx_names) * idx_page
         if (
             _glm5_extra_slot_layout(
@@ -1754,9 +1766,7 @@ def get_kv_cache_config_from_groups(
             idx_page,
             extra_groups,
         )
-        extra_widths = [
-            group.kv_cache_spec.page_size_bytes for group in extra_groups
-        ]
+        extra_widths = [group.kv_cache_spec.page_size_bytes for group in extra_groups]
         bytes_per_block = (
             target_width
             if extra_slot_layout is not None
@@ -1829,9 +1839,7 @@ def get_kv_cache_config_from_groups(
                 extra_offset = extra_base
                 for layer_name in group.layer_names:
                     add_tensor(layer_name, extra_specs[layer_name], extra_offset)
-                    extra_offset += (
-                        extra_specs[layer_name].page_size_bytes * num_blocks
-                    )
+                    extra_offset += extra_specs[layer_name].page_size_bytes * num_blocks
                 extra_base = extra_offset
 
         logger.info(
@@ -2631,6 +2639,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                enable_kv_transfer=group.enable_kv_transfer,
             )
         )
     return projected_groups

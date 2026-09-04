@@ -96,17 +96,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 
         unsupported: list[str] = []
-        cache_block_size = vllm_config.cache_config.block_size
         for g_idx, g in enumerate(kv_cache_config.transfer_groups):
             spec = g.kv_cache_spec
             if isinstance(spec, CrossAttentionSpec):
                 unsupported.append(f"group {g_idx}: CrossAttentionSpec")
             # Enforce Mamba align mode
-            if isinstance(spec, MambaSpec) and spec.block_size != cache_block_size:
+            if isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align":
                 unsupported.append(
-                    f"group {g_idx}: MambaSpec with block_size="
-                    f"{spec.block_size} != cache_config.block_size="
-                    f"{cache_block_size} (mamba_cache_mode != 'align')"
+                    f"group {g_idx}: MambaSpec with "
+                    f"mamba_cache_mode={spec.mamba_cache_mode!r} != 'align'"
                 )
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size

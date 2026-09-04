@@ -5,6 +5,9 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -29,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -58,6 +62,45 @@ def _make_kv_cache_config() -> KVCacheConfig:
         ],
         kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
     )
+
+
+def _make_mamba_kv_cache_config(mode: str) -> KVCacheConfig:
+    spec = MambaSpec(
+        block_size=4352,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode=mode,
+    )
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["mamba"], spec)],
+    )
+
+
+def _make_validation_config():
+    config = MagicMock()
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    return config
+
+
+def test_validate_accepts_aligned_mamba_with_larger_physical_block():
+    """Platform page unification may enlarge an aligned Mamba block."""
+    vllm_config = _make_validation_config()
+
+    mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+        vllm_config, _make_mamba_kv_cache_config("align")
+    )
+
+
+def test_validate_rejects_non_aligned_mamba():
+    vllm_config = _make_validation_config()
+
+    with pytest.raises(ValueError, match="mamba_cache_mode='none'"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            vllm_config, _make_mamba_kv_cache_config("none")
+        )
 
 
 def _make_block_stored() -> BlockStored:
