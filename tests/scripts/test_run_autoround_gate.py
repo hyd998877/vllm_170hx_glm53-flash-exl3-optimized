@@ -49,6 +49,32 @@ def test_gate_lock_is_singleton(
         first.close()
 
 
+def test_managed_group_retries_transitional_empty_cmdline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "server.pid"
+    pid_file.write_text("4321\n")
+    calls = 0
+
+    def identity(_pid: int):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "100", "empty", ""
+        return "100", "server", "/model --port 3000"
+
+    monkeypatch.setattr(runner, "process_identity", identity)
+    monkeypatch.setattr(runner.os, "getpgid", lambda _pid: 4321)
+    monkeypatch.setattr(runner.os, "getsid", lambda _pid: 4321)
+    monkeypatch.setattr(runner, "process_group_members", lambda _pgid: {})
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    group = runner.read_managed_group(
+        pid_file, Path("/model"), Path("/launcher"), timeout=1
+    )
+    assert group[:3] == (4321, 4321, "100")
+    assert calls == 2
+
+
 def test_parse_result_requires_every_requested_token(tmp_path: Path) -> None:
     path = tmp_path / "result.json"
     rows = [

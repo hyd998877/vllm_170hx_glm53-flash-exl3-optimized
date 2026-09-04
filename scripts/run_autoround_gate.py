@@ -157,31 +157,58 @@ def read_managed_group(
     pid_file: Path, model: Path, launcher: Path, timeout: float = 10
 ) -> ManagedGroup:
     deadline = time.monotonic() + timeout
+    last_error = f"managed process did not appear in {pid_file}"
     while time.monotonic() < deadline:
         try:
             raw_pid = pid_file.read_text().strip()
             if not raw_pid.isdigit():
-                raise GateError(f"invalid managed PID file: {pid_file}")
+                last_error = f"invalid managed PID file: {pid_file}"
+                time.sleep(0.1)
+                continue
             pid = int(raw_pid)
             identity = process_identity(pid)
             command = identity[2]
             is_server = str(model) in command and "--port 3000" in command
             is_launcher = str(launcher) in command and "foreground" in command
             if not (is_server or is_launcher):
-                raise GateError(f"unexpected managed process: {command}")
+                # nohup/setsid/bash can expose an empty or transitional
+                # cmdline for a few scheduler ticks before exec completes.
+                last_error = f"unexpected managed process: {command}"
+                time.sleep(0.1)
+                continue
             pgid = os.getpgid(pid)
             if pgid != pid or os.getsid(pid) != pid:
-                raise GateError(
+                last_error = (
                     f"managed process {pid} does not own a private session/group"
                 )
+                time.sleep(0.1)
+                continue
             return pid, pgid, identity[0], process_group_members(pgid)
         except FileNotFoundError:
             pass
         except GateError as error:
-            if "process disappeared" not in str(error):
-                raise
+            last_error = str(error)
+        except (ProcessLookupError, PermissionError) as error:
+            last_error = f"managed process transition: {error}"
         time.sleep(0.1)
-    raise GateError(f"managed process did not appear in {pid_file}")
+    raise GateError(last_error)
+
+
+def live_pid_file(pid_file: Path) -> int | None:
+    try:
+        raw = pid_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+    return pid
 
 
 def stop_owned_group(
@@ -1049,9 +1076,15 @@ def run_gate(out_dir: Path) -> dict[str, Any]:
             target_clear = False
             try:
                 wait_target_empty()
-                target_clear = port_pid(3000) is None
+                live_candidate = live_pid_file(
+                    CANDIDATE_RUNTIME / "server.pid"
+                )
+                target_clear = port_pid(3000) is None and live_candidate is None
                 if not target_clear:
-                    recovery_errors.append("port 3000 remained occupied")
+                    recovery_errors.append(
+                        "candidate slot remained occupied: "
+                        f"port_pid={port_pid(3000)}, candidate_pid={live_candidate}"
+                    )
             except BaseException as error:
                 recovery_errors.append(f"target drain: {error}")
             try:
