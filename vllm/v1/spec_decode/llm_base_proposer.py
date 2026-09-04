@@ -60,7 +60,7 @@ from vllm.v1.spec_decode.utils import (
     extend_all_queries_by_N,
     next_power_of_2,
 )
-from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
@@ -545,22 +545,26 @@ class SpecDecodeBaseProposer:
                     DFlashLagunaForCausalLM,
                 ),
             )
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
+            with record_function_or_nullcontext(
+                f"{self.method}: target-hidden-combine"
+            ):
+                target_hidden_states = self.model.combine_hidden_states(
+                    target_hidden_states
+                )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata = (
-            self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        with record_function_or_nullcontext(f"{self.method}: prepare-inputs"):
+            num_tokens, token_indices_to_sample, common_attn_metadata = (
+                self.set_inputs_first_pass(
+                    target_token_ids=target_token_ids,
+                    next_token_ids=next_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    token_indices_to_sample=token_indices_to_sample,
+                    cad=common_attn_metadata,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
             )
-        )
 
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
@@ -570,9 +574,10 @@ class SpecDecodeBaseProposer:
             self._determine_batch_execution_and_padding(num_tokens)
         )
 
-        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
-            num_tokens, num_input_tokens, mm_embed_inputs
-        )
+        with record_function_or_nullcontext(f"{self.method}: context-ingest"):
+            model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+                num_tokens, num_input_tokens, mm_embed_inputs
+            )
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.
@@ -595,7 +600,8 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            with record_function_or_nullcontext(f"{self.method}: draft-forward"):
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -625,9 +631,10 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
-            )
+            with record_function_or_nullcontext(f"{self.method}: lm-head-sample"):
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    sample_hidden_states, sampling_metadata
+                )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]

@@ -257,7 +257,7 @@ def fp8_paged_mqa_logits_triton(
     # prefill with varying N doesn't re-tune on every new chunk size.
     key=["num_heads", "head_dim"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["N"])
 def _fp8_mqa_logits_kernel(
     q_ptr,
     k_ptr,
@@ -432,8 +432,8 @@ def warmup_fp8_mqa_logits_triton(
     device: torch.device,
 ) -> None:
     """Prime the prefill `@triton.autotune` cache so first-call doesn't pay
-    the inline sweep (~5–8 s on A100 SM80). N is a runtime scalar, so one
-    small-M / long-N shape covers all chunk lengths."""
+    the inline sweep (~5–8 s on A100 SM80). ``N`` does not specialize on its
+    value or alignment, so one small-M / long-N shape covers all lengths."""
     m = _PREFILL_WARMUP_M
     n = _PREFILL_WARMUP_N
     q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)

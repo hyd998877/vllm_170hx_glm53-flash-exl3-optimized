@@ -63,8 +63,10 @@ _TEMP_ROWS_FUSED = 128
 # ``max_num_batched_tokens`` rows.  The Marlin sidecar layers no longer retain
 # their EXL3 tensors, so they must stay on Marlin for that profiling pass as
 # well as normal decode.  The long-context serving profile uses a 2048-token
-# scheduler budget to avoid splitting each 128K prefill into 256 tiny chunks.
-_TEMP_ROWS_MARLIN = 2048
+# adaptive scheduler budget to avoid splitting each 128K prefill into 256 tiny
+# chunks.  DFlash reserves two additional input rows, so a 2048-token idle
+# prefill is profiled/executed as 2050 rows.
+_TEMP_ROWS_MARLIN = 2050
 _FUSED_BUFFER_CACHE: dict[torch.device, tuple[torch.Tensor, ...]] = {}
 _FUSED_MOE_BUFFER_CACHE: dict[torch.device, tuple[torch.Tensor, ...]] = {}
 _MARLIN_CACHE: dict[torch.device, tuple[torch.Tensor, ...]] = {}

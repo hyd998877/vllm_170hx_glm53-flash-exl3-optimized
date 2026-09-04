@@ -400,7 +400,7 @@ def kpool_compress_and_write_cache(
 # Seed each request's incomplete pool into its paged tail during prefill.
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_tokens"])
 def _kpool_tail_seed_kernel(
     key_ptr,
     score_ptr,
@@ -443,7 +443,11 @@ def _kpool_tail_seed_kernel(
     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
     tl.store(tail_ptr + base + offs, k, mask=m)
-    tl.store(tail_ptr + block_base + KPOOL_HEAD + (t % KPOOL) * HEAD_DIM + offs, s, mask=m)
+    tl.store(
+        tail_ptr + block_base + KPOOL_HEAD + (t % KPOOL) * HEAD_DIM + offs,
+        s,
+        mask=m,
+    )
 
 
 def kpool_seed_tail_cache(

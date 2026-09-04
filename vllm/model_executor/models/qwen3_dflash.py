@@ -35,6 +35,7 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -644,25 +645,28 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
-        all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
-        all_k_normed = self._normalize_context_k(all_k)
+        with record_function_or_nullcontext("dflash: context-kv-projection"):
+            all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
+        with record_function_or_nullcontext("dflash: context-k-normalize"):
+            all_k_normed = self._normalize_context_k(all_k)
 
         # --- Fused RoPE across all layers ---
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
         # In-place RoPE: pass K as the "query" arg with key=None.
         all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-        ops.rotary_embedding(
-            positions_repeated,
-            all_k_flat,
-            None,
-            self._rope_head_size,
-            cos_sin_cache,
-            self._rope_is_neox,
-        )
+        with record_function_or_nullcontext("dflash: context-rope"):
+            positions_repeated = context_positions.repeat(L)
+            cos_sin_cache = self._rope_cos_sin_cache
+            if cos_sin_cache.dtype != all_k_flat.dtype:
+                cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+            ops.rotary_embedding(
+                positions_repeated,
+                all_k_flat,
+                None,
+                self._rope_head_size,
+                cos_sin_cache,
+                self._rope_is_neox,
+            )
 
         if context_slot_mapping is None:
             return
@@ -670,21 +674,22 @@ class DFlashQwen3Model(nn.Module):
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        for i in range(L):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
-            if slot_mapping is None:
-                continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
-            kv_cache = attn.kv_cache
-            attn.impl.do_kv_cache_update(
-                attn,
-                all_k_final[i],
-                all_v[i],
-                kv_cache,
-                slot_mapping,
-            )
+        with record_function_or_nullcontext("dflash: context-kv-cache-write"):
+            for i in range(L):
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
+                if slot_mapping is None:
+                    continue  # dummy run: skip cache ops
+                attn = self._attn_layers[i]
+                kv_cache = attn.kv_cache
+                attn.impl.do_kv_cache_update(
+                    attn,
+                    all_k_final[i],
+                    all_v[i],
+                    kv_cache,
+                    slot_mapping,
+                )
 
     def forward(
         self,

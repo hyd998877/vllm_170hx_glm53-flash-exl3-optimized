@@ -486,8 +486,11 @@ decode 218.78 秒、排队约 0 秒。服务没有 Waiting、Deferred 或 preemp
   ITL，这是 TTFT 收益与在线抢占粒度之间的主要代价。
 
 功能门禁已通过：AsyncScheduler、Mamba 对齐与 partial-prefix-cache 定向测试合计
-`95 passed`。当前结论仍为 `functional-only`，正式 3000 服务尚未重启，不能在真实
-冷/热 A/B 完成前宣称 TTFT 提升。
+`95 passed`。正式 3000 服务（GPU `0,2,4,6`）已启用该策略：唯一 128K 冷请求
+TTFT 从固定 256-token chunk 的 92.741 秒降到 33.433 秒，改善 64.0%；相同请求热
+重放 TTFT 1.077 秒。并发注入时日志确认下一步回退到 256。一次
+`6×128K→512` 回归被两个额外业务请求污染，出现 Waiting=2，结果只保留为干扰
+样本，不能用其 171.32 tok/s 改写正式基线。
 
 正式验证按下列顺序执行，每项只晋级不同时改变其他变量：
 
@@ -521,3 +524,78 @@ decode 218.78 秒、排队约 0 秒。服务没有 Waiting、Deferred 或 preemp
 不把 DFlash 作为冷 prefill 加速项：它主要提高 decode，既有 A/B 显示其 TTFT
 约增加 14%。可研究“prefill 不运行 draft、进入 decode 后启用”，但动态切换涉及
 KV/runner 状态，必须独立于本次自适应 chunk 验证。
+
+## 12. 方向 2/3/4/6、AutoRound 与新硬件内核（2026-09-04）
+
+本轮只操作端口 3000 和 GPU `0,2,4,6`；端口 3001/GPU `1,3,5,7` 的 DeepSeek
+实例不停止、不重启；不修改 GPU 功耗或时钟。
+
+### 12.1 方向 2、3、4、6 的执行结论
+
+| 方向 | 当前动作与证据 | 状态 | 后续触发条件 |
+|---|---|---|---|
+| 2 会话粘性/KV 保留 | 新增 `scripts/audit_prefix_requests.py`，按生产 tokenizer/template 比较真实公共 token 前缀，报告首个差异并审计时间戳、UUID、tools/JSON 顺序；单实例 3000 没有路由分叉 | **工具通过，路由不适用** | 出现两个以上 GLM 实例时，按稳定 `session_id` 做一致性哈希；不得把 session ID 当成 prefix 相等的替代品 |
+| 3 P/D 分离 | 一份 PP4 已占四卡，另一组四卡由 3001 使用；prefill/decode 各自保有完整模型至少还需四卡，且跨 PCIe PHB 传 128K MLA/KDA/DFlash 状态成本高 | **rejected_capacity** | 增加四张空闲卡，或先证明模型副本可在更少卡完整承载，再做 connector/state 传输微基准 |
+| 4 GPU 拓扑 | `0–3` 与 `4–7` 各组内全 PIX，组间 PHB；`0,2,4,6` 的 PP 路径只有 `2→4` 一次跨 PHB，已是跨两个 PCIe 域时的最少跨域边数 | **当前约束下最优/不可 A/B** | 只有允许迁移或停止 3001 后，才比较连续 `0,1,2,3` 或 `4,5,6,7`；不能在业务流量中偷换卡 |
+| 6 请求约束 | 短问显式 `max_tokens=64` 且 `enable_thinking=false`，实测 TTFT 0.46–0.50 秒、总耗时 0.86–0.91 秒、14 completion tokens | **通过（客户端策略）** | 由调用方按场景设置；不在服务端全局关闭 reasoning，以免损害复杂任务 |
+
+### 12.2 AutoRound W4A16 候选
+
+候选为 `Intel/GLM-5.3-Flash-W4A16-AutoRound`，配置已静态解析为
+`auto_round:auto_gptq / INT4 / group_size=128 / symmetric`。它把 routed experts
+量化为 W4A16，而 attention、KDA/MLA、sparse indexer、shared experts、视觉、norm
+等 679 个显式条目保留为 16-bit。本机 CUDA 路径会使用 INC/GPTQ Marlin，不会
+使用 Intel XPU kernel。
+
+官方模型卡只给出四个短任务：BF16 平均 0.8399，INT4 平均 0.8386，绝对下降
+0.0013，相对保留 99.84%。这是低质量损失的正面证据，但没有覆盖代码、OCR、
+tool calling、128K/512K needle 或与当前 EXL3 4bpw 的直接比较。
+
+性能不能预先判定更快。当前冠军已把 routed experts 转成更细粒度的 group-size 64
+Marlin sidecar；AutoRound 的 group-size 128 scale 开销略小，但 checkpoint 总量约
+181.5 GB，保留的 BF16 路径更多，可能增加权重带宽、PP stage 显存和降低 KV 容量。
+因此预期为“可能持平或稍慢、质量证据较好”，以实测为准。
+
+执行门禁：
+
+1. 下载 49 个文件/34 个 shard 后，逐文件核对 ModelScope API 的 Size 与 SHA-256；
+   任一不符不启动。
+2. 使用 `scripts/serve_glm53_autoround_sm80.sh` 和独立 runtime 目录加载；先检查
+   INC/GPTQ Marlin dispatch、各 PP rank 权重/峰值、KV tokens、视觉 profiling、
+   完整 kernel warmup 和 API identity。
+3. L2：1K→16、OCR、tool/reasoning smoke；L3：6×1K→512 三个配对 seed；L4：
+   8K/32K；只有 L3 中位提升至少 5%、L4 不回退才跑 6×128K→512。
+4. 质量门禁至少包含固定文本/代码样本、500K needle、OCR 和工具调用；性能与质量
+   同时通过才替换 `/mnt/nvme0/start_glm53_3000.sh` 的正式模型，否则自动恢复 EXL3。
+
+### 12.3 完整 warmup
+
+启动 warmup 已覆盖 mHC、KPool cache/tail、prefill/decode MQA logits、Mamba
+acceptance 和 CUDA Graph。服务级探针仍发现 `_kpool_tail_seed_kernel` 与
+`_fp8_mqa_logits_kernel` 各一次 JIT。根因是 Triton 会把普通整数 `1`、16 对齐值
+和一般值做不同 specialization：warmup 的 `n_tokens=1`、`N=8192` 无法代表所有
+真实长度。
+
+实验分支把这两个只用于边界 mask/grid 的整数加入 `do_not_specialize`，避免按 prompt
+长度制造无收益的内核副本；定向测试当前为 `54 passed`，ruff 通过。最终验收要求
+重启后以 verbose JIT monitor 连续跑短、8K、128K 冷请求，推理时间窗内上述两个
+kernel 均无新编译。warmup 主要消除首次延迟尖峰，不应宣称提高稳态 tok/s。
+
+### 12.4 FlashMLA、DeepGEMM、SM90/SM100 与 V4 integration
+
+当前 CMP 170HX 的 compute capability 是 8.0（SM80）。仓库中的 FlashMLA sparse
+明确只接受 SM90/SM100，DeepGEMM 只在 Hopper/Blackwell 路径启用，因此两者在
+本机不是可打开的优化开关；强制选择会失败或回退，不能产生速度收益。
+
+换到 SM90/SM100 后，FlashMLA/FlashInfer sparse MLA、DeepGEMM、TMA/WGMMA 以及
+原生 FP8/FP4 Tensor Core 有明确潜力，尤其能替代当前 SM80 Triton indexer/MQA
+fallback。但收益还取决于 checkpoint：AutoRound W4A16 仍主要走 Marlin，并不会
+因为安装 DeepGEMM 自动变成 FP8/FP4 模型。应为新硬件重新选择 BF16/FP8/NVFP4
+权重与 KV 格式后做 A/B。
+
+DeepSeek V4 专用 sparse MLA/indexer 不能直接移植到 GLM：V4 使用不同的
+SWA/hash/compressor、top-k=512、nextn=3、576-byte cache/metadata，而 GLM 使用
+KDA/Mamba hybrid state、top-k=2048、kpool=4、nextn=1 和 512-wide NoPE MLA。
+可复用的只有设计思想（flatten metadata、融合 Q/RoPE/quant、persistent workspace、
+调度计划缓存）。若要落地，必须写 GLM 专用 kernel，并先通过 token/state/KV layout
+正确性测试和 ≥10% kernel、≥2% 端到端 Amdahl 门禁；本轮不接入 V4 二进制路径。

@@ -30,6 +30,14 @@ class Model:
         return iter((self, self.indexer))
 
 
+def test_runtime_lengths_do_not_create_indexer_specializations() -> None:
+    import vllm.models.glm5next.nvidia.ops.kpool_compress as kpool_ops
+    import vllm.v1.attention.ops.mqa_logits_triton as mqa_ops
+
+    assert "n_tokens" in kpool_ops._kpool_tail_seed_kernel.do_not_specialize
+    assert "N" in mqa_ops._fp8_mqa_logits_kernel.fn.do_not_specialize
+
+
 def test_indexer_warmup_uses_bound_cache_and_pointer_variants(monkeypatch) -> None:
     # Import the model side first, matching production construction order and
     # avoiding the package-level GLM export importing attention while the
