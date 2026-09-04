@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -527,6 +528,46 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if envs.VLLM_PP_ADAPTIVE_PREFILL_DIAGNOSTICS:
+                group_usage = []
+                for index, manager in enumerate(
+                    self.coordinator.single_type_managers
+                ):
+                    all_block_ids = {
+                        block.block_id
+                        for blocks in manager.req_to_blocks.values()
+                        for block in blocks
+                        if not block.is_null
+                    }
+                    request_blocks = manager.req_to_blocks.get(
+                        request.request_id, ()
+                    )
+                    request_block_ids = {
+                        block.block_id
+                        for block in request_blocks
+                        if not block.is_null
+                    }
+                    group_usage.append(
+                        f"g{index}:{type(manager).__name__}"
+                        f"/bs={manager.block_size}"
+                        f"/all={len(all_block_ids)}"
+                        f"/req={len(request_block_ids)}"
+                        f"/table={len(request_blocks)}"
+                    )
+                logger.warning(
+                    "KV allocation failed: request=%s status=%s "
+                    "computed=%d in_flight=%d new=%d required=%d "
+                    "available=%d free=%d groups=[%s]",
+                    request.request_id,
+                    request.status.name,
+                    request.num_computed_tokens,
+                    request.num_in_flight_tokens,
+                    num_new_tokens,
+                    required_blocks,
+                    available_blocks,
+                    self.block_pool.get_num_free_blocks(),
+                    ", ".join(group_usage),
+                )
             return None
 
         if (
