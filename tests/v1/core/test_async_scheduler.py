@@ -52,7 +52,7 @@ def test_adaptive_prefill_tracks_concurrency(
 
     scheduler.add_request(second)
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens[first.request_id] == 256
+    assert first.request_id not in output.num_scheduled_tokens
     assert output.num_scheduled_tokens[second.request_id] == 256
 
     scheduler.finish_requests(second.request_id, RequestStatus.FINISHED_ABORTED)
@@ -93,6 +93,34 @@ def test_adaptive_prefill_preserves_busy_batch_budget(
     assert output.total_num_scheduled_tokens == 1024
     assert len(output.num_scheduled_tokens) == 4
     assert set(output.num_scheduled_tokens.values()) == {256}
+
+
+def test_adaptive_prefill_balances_more_requests_than_busy_batch_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed running order must not starve the fifth and sixth prefills."""
+    scheduler = _create_adaptive_prefill_scheduler(monkeypatch)
+    requests = create_requests(6, num_tokens=7168)
+
+    scheduler.add_request(requests[0])
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens[requests[0].request_id] == 2048
+
+    for request in requests[1:]:
+        scheduler.add_request(request)
+
+    second_output = scheduler.schedule()
+    assert requests[0].request_id not in second_output.num_scheduled_tokens
+    assert len(second_output.num_scheduled_tokens) == 4
+
+    scheduler.schedule()
+
+    for _ in range(20):
+        scheduler.schedule()
+
+    computed_tokens = [request.num_computed_tokens for request in requests]
+    assert requests[5].num_computed_tokens > 0
+    assert max(computed_tokens) - min(computed_tokens) <= 256
 
 
 @pytest.mark.parametrize(

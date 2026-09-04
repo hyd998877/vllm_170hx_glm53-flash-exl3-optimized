@@ -492,14 +492,28 @@ TTFT 从固定 256-token chunk 的 92.741 秒降到 33.433 秒，改善 64.0%；
 `6×128K→512` 回归被两个额外业务请求污染，出现 Waiting=2，结果只保留为干扰
 样本，不能用其 171.32 tok/s 改写正式基线。
 
+无外部业务、暂停 AutoRound 下载后的正式六路复核暴露了第二个调度问题：共同
+decode 窗口仅 37.07 tok/s，每路中位 9.02 tok/s，TTFT 分成
+220.27/238.81/287.91 秒三批；全程 Running=6、Waiting=0、Preemption=0。根因不是
+KV 容量，而是 busy budget=1024 每轮只能容纳 `4×256`，RUNNING 队列又固定按
+FCFS 从头扫描；领先的四个 prefill 会持续占满预算，第五、第六路无法及时追平，
+并造成 decode/prefill 长时间混跑。候选修复在并发纯 prefill 时按
+`num_computed_tokens` 最少者优先，并让领先 RUNNING 请求为落后的 WAITING prefill
+让路。它不恢复固定六路 cohort barrier，也不延迟真正单路的首个 2048-token 块。
+离线自适应定向回归 `7 passed`、完整 AsyncScheduler 回归 `27 passed`；其中新用例
+覆盖“先到一路 2048、随后五路到达”并要求最终进度差不超过 256。需重启后的
+服务级 A/B 才能晋级正式配置。失败原始结果为
+`runtime/adaptive-prefill-20260904/c6-128k-512-clean-20260904.json`。
+
 正式验证按下列顺序执行，每项只晋级不同时改变其他变量：
 
 1. 同一条 128K/154K 唯一冷前缀分别用 256、1024、2048，记录 prefill 时间、
    TTFT、每 stage GPU 利用率和调度步数；2048 相对 1024 改善不足 3% 就保留 1024。
 2. 在 2048 prefill 进行中注入短 decode，验证下一步块大小为 256，并记录 decode
    ITL 的 p50/p95/max；p95 回退超过 10% 则降低空闲块到 1024。
-3. 回归 `6×128K→512`，要求 Waiting/Deferred/Preemption 都为 0，聚合 decode 与
-   当前正式基线差异不超过 3%。
+3. 部署并发 prefill 公平调度后回归 `6×128K→512`，要求
+   Waiting/Deferred/Preemption 都为 0、TTFT spread≤8 秒，聚合 decode 与当前正式
+   基线差异不超过 3%。
 4. 重复相同请求验证 prefix-cache 热路径没有回退，并确认 500K needle 与 OCR
    正确性仍通过。
 

@@ -6,6 +6,7 @@ from collections import Counter
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
@@ -63,6 +64,8 @@ class AsyncScheduler(Scheduler):
             self.max_num_scheduled_tokens,
         )
         self._adaptive_prefill_request_id: str | None = None
+        self._balanced_prefill_ids: set[str] = set()
+        self._min_prefill_tokens_by_priority: dict[int, int] = {}
         if self._adaptive_prefill_enabled:
             if self.scheduler_config.long_prefill_token_threshold <= 0:
                 raise ValueError(
@@ -98,6 +101,7 @@ class AsyncScheduler(Scheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self._update_adaptive_prefill_request()
+        self._balance_adaptive_prefills()
         if self._pp_prefill_cohort_barrier:
             self._update_prefill_cohort_barrier()
         scheduler_output = super().schedule(throttle_prefills)
@@ -189,6 +193,77 @@ class AsyncScheduler(Scheduler):
         ):
             return self._adaptive_prefill_busy_tokens
         return super()._get_input_budget()
+
+    def _active_adaptive_prefills(self) -> list[Request]:
+        if not self._adaptive_prefill_enabled:
+            return []
+        return [
+            request
+            for request in self.requests.values()
+            if not request.is_finished()
+            and request.num_output_tokens == 0
+            and request.num_computed_tokens < request.num_prompt_tokens
+            and request.status
+            in (
+                RequestStatus.WAITING,
+                RequestStatus.RUNNING,
+                RequestStatus.PREEMPTED,
+            )
+        ]
+
+    def _adaptive_prefill_priority(self, request: Request) -> int:
+        return request.priority if self.policy == SchedulingPolicy.PRIORITY else 0
+
+    def _balance_adaptive_prefills(self) -> None:
+        """Keep concurrent prefills within one scheduling quantum."""
+        self._balanced_prefill_ids.clear()
+        self._min_prefill_tokens_by_priority.clear()
+        prefills = self._active_adaptive_prefills()
+        if len(prefills) < 2:
+            return
+
+        priority_counts = Counter(
+            self._adaptive_prefill_priority(request) for request in prefills
+        )
+        self._balanced_prefill_ids.update(
+            request.request_id
+            for request in prefills
+            if priority_counts[self._adaptive_prefill_priority(request)] > 1
+        )
+        for request in prefills:
+            if request.request_id not in self._balanced_prefill_ids:
+                continue
+            priority = self._adaptive_prefill_priority(request)
+            previous = self._min_prefill_tokens_by_priority.get(priority)
+            if previous is None or request.num_computed_tokens < previous:
+                self._min_prefill_tokens_by_priority[priority] = (
+                    request.num_computed_tokens
+                )
+
+        active_requests = [
+            request
+            for request in self.requests.values()
+            if not request.is_finished()
+        ]
+        if len(prefills) != len(active_requests):
+            return
+
+        prefill_ids = {request.request_id for request in prefills}
+        self.running.sort(
+            key=lambda request: (
+                self._adaptive_prefill_priority(request),
+                0 if request.request_id in prefill_ids else 1,
+                request.num_computed_tokens,
+                request.arrival_time,
+            )
+        )
+
+    def _should_yield_adaptive_prefill(self, request: Request) -> bool:
+        if request.request_id not in self._balanced_prefill_ids:
+            return False
+        priority = self._adaptive_prefill_priority(request)
+        min_computed_tokens = self._min_prefill_tokens_by_priority[priority]
+        return request.num_computed_tokens > min_computed_tokens
 
     def _should_release_stalled_prefill_cohort(
         self, scheduler_output: SchedulerOutput
@@ -296,11 +371,12 @@ class AsyncScheduler(Scheduler):
         return False
 
     def _should_defer_prefill_chunk(self, request: Request) -> bool:
-        return (
+        cohort_deferred = (
             self._pp_prefill_cohort_barrier
             and not self._pp_prefill_cohort_released
             and request.request_id in self._pp_prefill_cohort_held
         )
+        return cohort_deferred or self._should_yield_adaptive_prefill(request)
 
     def _should_defer_decode_request(self, request: Request) -> bool:
         return (
