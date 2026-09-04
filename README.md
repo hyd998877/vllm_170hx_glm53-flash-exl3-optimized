@@ -198,14 +198,15 @@ scripts/serve_glm53_sm80.sh
 ```bash
 ADAPTIVE_PREFILL=1 \
 ADAPTIVE_PREFILL_MAX_TOKENS=2048 \
-ADAPTIVE_PREFILL_BUSY_TOKENS=1024 \
+ADAPTIVE_PREFILL_BUSY_TOKENS=1550 \
 scripts/serve_glm53_sm80.sh
 ```
 
 脚本会为 DFlash k=2 自动把 runner 输入容量设为 2050；只有唯一 prompt prefill
-使用 2048，出现第二个请求或 decode 时总批预算恢复 1024、每个长 prefill 块恢复
-`LONG_PREFILL_TOKEN_THRESHOLD=256`。2050 是静态 buffer 容量，不代表繁忙调度也会
-使用 2050。该功能目前是实验配置，完成真实 128K 冷/热 A/B 前不作为默认 profile。
+使用 2048，出现第二个请求或 decode 时每个长 prefill 块恢复
+`LONG_PREFILL_TOKEN_THRESHOLD=256`。繁忙总预算 1550 可同步容纳六路
+`6×(256+2 DFlash slots)=1548`，避免 1024 预算将六路拆成 4/2 微批；2050 只是静态
+buffer 容量。该功能目前是实验配置，完成真实 128K 冷/热 A/B 前不作为默认 profile。
 
 脚本以前台进程运行并监听 `0.0.0.0:30002`。首次启动会加载约 315 GiB 的目标
 权重加 sidecar 数据、初始化四个 PP worker、分配 KV cache 并完成 JIT/CUDA

@@ -23,12 +23,16 @@ def _create_adaptive_prefill_scheduler(
     *,
     enabled: bool = True,
     adaptive_max_tokens: int = 2048,
+    adaptive_busy_tokens: int = 1024,
     max_num_batched_tokens: int = 2050,
     max_num_seqs: int = 16,
+    num_speculative_tokens: int | None = None,
 ) -> AsyncScheduler:
     monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL", str(int(enabled)))
     monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS", str(adaptive_max_tokens))
-    monkeypatch.setenv("VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS", "1024")
+    monkeypatch.setenv(
+        "VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS", str(adaptive_busy_tokens)
+    )
     monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     scheduler = create_scheduler(
         async_scheduling=True,
@@ -36,6 +40,10 @@ def _create_adaptive_prefill_scheduler(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         long_prefill_token_threshold=256,
+        num_speculative_tokens=num_speculative_tokens,
+        speculative_method=(
+            "ngram_gpu" if num_speculative_tokens is not None else None
+        ),
     )
     assert isinstance(scheduler, AsyncScheduler)
     return scheduler
@@ -94,6 +102,27 @@ def test_adaptive_prefill_preserves_busy_batch_budget(
 
     assert output.total_num_scheduled_tokens == 1024
     assert len(output.num_scheduled_tokens) == 4
+    assert set(output.num_scheduled_tokens.values()) == {256}
+
+
+def test_adaptive_prefill_busy_budget_can_fit_six_dflash_prefills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1550 tokens fit six 256-token chunks plus two draft slots each."""
+    scheduler = _create_adaptive_prefill_scheduler(
+        monkeypatch,
+        adaptive_busy_tokens=1550,
+        max_num_seqs=6,
+        num_speculative_tokens=2,
+    )
+    requests = create_requests(6, num_tokens=4096)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 1536
+    assert len(output.num_scheduled_tokens) == 6
     assert set(output.num_scheduled_tokens.values()) == {256}
 
 
