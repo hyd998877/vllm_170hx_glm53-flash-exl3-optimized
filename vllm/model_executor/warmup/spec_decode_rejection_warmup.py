@@ -85,7 +85,11 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
             rejection_sample(
                 target_logits=target_logits,
                 draft_logits=draft_logits,
-                draft_sampled=torch.zeros(num_logits, dtype=torch.int64, device=device),
+                # Serving gathers draft token ids from InputBuffers.input_ids,
+                # whose storage dtype is int32. Triton specializes pointer
+                # element types, so warming this path with int64 leaves the
+                # first real DFlash request to compile rejection/resample.
+                draft_sampled=torch.zeros(num_logits, dtype=torch.int32, device=device),
                 cu_num_logits=torch.tensor(
                     [0, num_logits], dtype=torch.int32, device=device
                 ),

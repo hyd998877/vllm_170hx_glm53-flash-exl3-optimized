@@ -38,6 +38,23 @@ def test_runtime_lengths_do_not_create_indexer_specializations() -> None:
     assert "N" in mqa_ops._fp8_mqa_logits_kernel.fn.do_not_specialize
 
 
+def test_prefill_mqa_warmup_covers_output_stride_alignment(monkeypatch) -> None:
+    import vllm.v1.attention.ops.mqa_logits_triton as mqa_ops
+
+    calls = []
+    monkeypatch.setattr(
+        mqa_ops,
+        "fp8_mqa_logits_triton",
+        lambda q, kv, weights, ks, ke: calls.append(
+            (kv[0].shape[0], ks.storage_offset())
+        ),
+    )
+
+    mqa_ops.warmup_fp8_mqa_logits_triton(32, 128, torch.device("cpu"))
+
+    assert calls == [(8192, 0), (8192, 1), (8191, 0), (8191, 1)]
+
+
 def test_indexer_warmup_uses_bound_cache_and_pointer_variants(monkeypatch) -> None:
     # Import the model side first, matching production construction order and
     # avoiding the package-level GLM export importing attention while the

@@ -222,7 +222,11 @@ def _format_verbose_triton_compile_details(kwargs: Mapping[str, object]) -> str:
         f"constexprs={_format_constants(fn, compile_info)}; "
         f"signature={_format_signature(compile_info)}; "
         f"extra_compile_info={_format_extra_compile_info(compile_info)}; "
-        f"key={_safe_repr(key)}"
+        # The compact key is enough for routine monitoring, but verbose mode
+        # is specifically a diagnosis aid. Keep the complete positional key
+        # so warmup and serving specializations can be compared argument by
+        # argument instead of truncating at the first few pointer entries.
+        f"key={_safe_repr(key, max_len=20_000)}"
     )
 
 

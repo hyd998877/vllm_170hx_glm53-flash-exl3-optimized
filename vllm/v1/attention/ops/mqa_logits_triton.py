@@ -435,21 +435,21 @@ def warmup_fp8_mqa_logits_triton(
     the inline sweep (~5–8 s on A100 SM80). ``N`` does not specialize on its
     value or alignment, so one small-M / long-N shape covers all lengths."""
     m = _PREFILL_WARMUP_M
-    n = _PREFILL_WARMUP_N
     q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
-    k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
-    scales = torch.zeros(n, dtype=torch.float32, device=device)
     weights = torch.zeros(m, num_heads, dtype=torch.float32, device=device)
-    # Metadata in serving is sliced from persistent buffers. Triton keys a
-    # separate specialization for an unaligned pointer, so warm both storage
-    # offsets; otherwise the first long request still compiles inline despite
-    # this helper having run at startup.
-    for offset in (0, 1):
-        ks_storage = torch.zeros(m + 1, dtype=torch.int32, device=device)
-        ke_storage = torch.full((m + 1,), n, dtype=torch.int32, device=device)
-        ks = ks_storage[offset : offset + m]
-        ke = ke_storage[offset : offset + m]
-        fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
+    # Serving may expose both a 16-divisible and a non-divisible logits row
+    # stride as the compressed kpool grows. N itself does not specialize, but
+    # Triton still specializes the contiguous output stride's divisibility.
+    # Prime both classes, crossed with aligned/unaligned metadata views.
+    for n in (_PREFILL_WARMUP_N, _PREFILL_WARMUP_N - 1):
+        k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
+        scales = torch.zeros(n, dtype=torch.float32, device=device)
+        for offset in (0, 1):
+            ks_storage = torch.zeros(m + 1, dtype=torch.int32, device=device)
+            ke_storage = torch.full((m + 1,), n, dtype=torch.int32, device=device)
+            ks = ks_storage[offset : offset + m]
+            ke = ke_storage[offset : offset + m]
+            fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
 
 
 def warmup_fp8_paged_mqa_logits_triton(

@@ -9,8 +9,37 @@ import torch
 
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    _prepare_dflash_inputs_kernel,
     prepare_dflash_inputs,
 )
+
+
+def test_request_metadata_alignment_does_not_specialize() -> None:
+    expected = {
+        "out_input_ids_ptr",
+        "out_query_positions_ptr",
+        "out_query_start_loc_ptr",
+        "out_seq_lens_ptr",
+        "out_query_slot_mapping_ptr",
+        "out_context_positions_ptr",
+        "out_context_slot_mapping_ptr",
+        "out_sample_indices_ptr",
+        "out_sample_pos_ptr",
+        "out_sample_idx_mapping_ptr",
+        "out_temperature_ptr",
+        "out_seeds_ptr",
+        "target_positions_ptr",
+        "target_query_start_loc_ptr",
+        "idx_mapping_ptr",
+        "last_sampled_ptr",
+        "next_prefill_tokens_ptr",
+        "num_sampled_ptr",
+        "num_rejected_ptr",
+        "temperature_ptr",
+        "seeds_ptr",
+        "block_table_ptr",
+    }
+    assert set(_prepare_dflash_inputs_kernel.do_not_specialize_on_alignment) == expected
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"

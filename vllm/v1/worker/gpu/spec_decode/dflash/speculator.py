@@ -491,7 +491,38 @@ class DFlashSpeculator(DraftModelSpeculator):
         return self.draft_tokens[:num_reqs]
 
 
-@triton.jit
+@triton.jit(
+    # The request metadata below mixes persistent buffers with per-step views.
+    # Their base alignment can change without changing kernel semantics. This
+    # small input-preparation kernel gains nothing measurable from compiling a
+    # Cartesian set of alignment variants, while each missing variant stalls
+    # the first request. Keep constexpr BLOCK_SIZE specialization but collapse
+    # dynamic metadata pointer alignment into one serving-safe binary.
+    do_not_specialize_on_alignment=[
+        "out_input_ids_ptr",
+        "out_query_positions_ptr",
+        "out_query_start_loc_ptr",
+        "out_seq_lens_ptr",
+        "out_query_slot_mapping_ptr",
+        "out_context_positions_ptr",
+        "out_context_slot_mapping_ptr",
+        "out_sample_indices_ptr",
+        "out_sample_pos_ptr",
+        "out_sample_idx_mapping_ptr",
+        "out_temperature_ptr",
+        "out_seeds_ptr",
+        "target_positions_ptr",
+        "target_query_start_loc_ptr",
+        "idx_mapping_ptr",
+        "last_sampled_ptr",
+        "next_prefill_tokens_ptr",
+        "num_sampled_ptr",
+        "num_rejected_ptr",
+        "temperature_ptr",
+        "seeds_ptr",
+        "block_table_ptr",
+    ]
+)
 def _prepare_dflash_inputs_kernel(
     # Outputs
     out_input_ids_ptr,
