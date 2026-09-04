@@ -211,11 +211,17 @@ scripts/serve_glm53_sm80.sh
 buffer 容量。正式 `6×128K→512` 已验证该配置无 Waiting/Deferred/Preemption；
 换用不同并发、上下文或显存规格时仍应重新执行容量门禁。
 
-AutoRound 快照完成校验后，可用 `scripts/run_autoround_gate.py --execute` 执行
-自动 A/B：脚本只管理端口 3000 和 GPU `0,2,4,6`，先跑配对 EXL3 基线，再按
-1K→8K/32K→128K→500K needle/OCR 的顺序晋级；任何吞吐、容量、调度、JIT 或
-正确性失败都会停止候选并恢复正式 EXL3。它会锁定并持续核对端口 3001/GPU
-`1,3,5,7` 的 DeepSeek 身份，检测到变化即 fail-closed。
+AutoRound W4A16 的自动 A/B 已完成。49/49 文件通过 Size/SHA-256 校验，候选成功
+走 INC INT4 + Marlin、KV capacity 为 1,459,504 tokens，文本、OCR 和 forced
+tool-call smoke 通过；但配对 `6×1K→512` 的共同 decode 中位仅 179.96 tok/s，
+低于 EXL3 的 192.71 tok/s（-6.62%），也未达到 202.35 tok/s 晋级线。因此脚本
+在 L3 提前淘汰候选，没有浪费时间运行 128K/500K 长测，并已恢复正式 EXL3。
+原始结果见
+`/mnt/nvme0/keys-vllm-glm53/runtime/autoround-ab-final-r3/`。
+
+以后重跑可使用 `scripts/run_autoround_gate.py --execute`；脚本只管理端口 3000 和
+GPU `0,2,4,6`，并锁定、持续核对端口 3001/GPU `1,3,5,7` 的 DeepSeek 身份，
+检测到变化即 fail-closed。
 
 脚本以前台进程运行并监听 `0.0.0.0:3000`。首次启动会加载约 315 GiB 的目标
 权重加 sidecar 数据、初始化四个 PP worker、分配 KV cache 并完成 JIT/CUDA

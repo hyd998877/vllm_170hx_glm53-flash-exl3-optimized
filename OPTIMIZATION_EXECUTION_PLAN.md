@@ -605,7 +605,7 @@ Marlin sidecar；AutoRound 的 group-size 128 scale 开销略小，但 checkpoin
 
 执行门禁：
 
-1. 下载 49 个文件/34 个 shard 后，逐文件核对 ModelScope API 的 Size 与 SHA-256；
+1. 下载 49 个文件/36 个 checkpoint shard 后，逐文件核对 ModelScope API 的 Size 与 SHA-256；
    任一不符不启动。
 2. 使用 `scripts/serve_glm53_autoround_sm80.sh` 和独立 runtime 目录加载；先检查
    INC/GPTQ Marlin dispatch、各 PP rank 权重/峰值、KV tokens、视觉 profiling、
@@ -615,12 +615,27 @@ Marlin sidecar；AutoRound 的 group-size 128 scale 开销略小，但 checkpoin
 4. 质量门禁至少包含固定文本/代码样本、500K needle、OCR 和工具调用；性能与质量
    同时通过才替换 `/mnt/nvme0/start_glm53_3000.sh` 的正式模型，否则自动恢复 EXL3。
 
-截至 2026-09-04，AutoRound 快照仍在 ModelScope 续传（Hugging Face 直连和
-hf-mirror 探测均超时）；8 路实际约 20–30 MiB/s，16 路无提速后已回退 8 路。
-当前约 `84.7/169.0 GiB`、`20/49` 文件完整，生产 GLM 服务保持运行。配置静态
-门禁已先通过：`INCConfig.from_config` 解析为 `inc / INT4 / gs128 / symmetric /
-auto_round:auto_gptq`，相关离线测试 `13 passed`。下载完成并逐文件 Size/SHA-256
-校验通过前，禁止停止正式服务或启动 AutoRound 候选。
+2026-09-04 下载完成；49/49 文件的 Size/SHA-256 校验全部通过，索引实际包含
+36 个 checkpoint shard。配置静态门禁通过：`INCConfig.from_config` 解析为
+`inc / INT4 / gs128 / symmetric / auto_round:auto_gptq`，相关离线测试
+`13 passed`。候选在 SM80 上实际选择 `MARLIN` WNA16 MoE backend，视觉、文本和
+forced tool-call smoke 均通过；启动得到 KV capacity `1,459,504 tokens`。
+
+2026-09-05 完成第三轮干净的配对 A/B。两边均先做完整 `6×1K→512` 不计分
+warmup，再使用相同三个 seed 计分；指标为从最早首 token 到最晚末 token 的共同
+decode 窗口：
+
+| 模型 | warmup | 三次 L3 | 中位 | 相对 EXL3 |
+|---|---:|---|---:|---:|
+| EXL3 4bpw | 179.51 | 189.72 / 192.71 / 195.94 | **192.71** | 基线 |
+| AutoRound W4A16 | 172.92 | 177.95 / 184.10 / 179.96 | **179.96** | **-6.62%** |
+
+AutoRound 的晋级线为 EXL3 中位的 105%，即 `202.35 tok/s`；候选低于晋级线
+11.06%，因此状态为 **rejected_performance**。若按端到端 wall-clock 口径，候选
+三次中位为 171.45、EXL3 为 183.20，结论相同。脚本按设计停止后续 8K/32K、
+128K 和 500K 长测，避免在已失败候选上浪费时间，并恢复正式 EXL3。原始记录位于
+`/mnt/nvme0/keys-vllm-glm53/runtime/autoround-ab-final-r3/`；`SUMMARY.json` 的拒绝原因是
+`L3 median improvement below 5%`。
 
 后续服务级验证已固化为 `scripts/run_autoround_gate.py`：执行前锁定 3001 和
 GPU `1,3,5,7` 的 PID/starttime/cmdline/GPU-process 快照，先对当前 EXL3 重跑
@@ -629,6 +644,13 @@ GPU `1,3,5,7` 的 PID/starttime/cmdline/GPU-process 快照，先对当前 EXL3 �
 门禁；L3 中位未提高 5% 时即停止，不浪费 128K 时间。无论成功、失败或收到
 SIGTERM/SIGHUP，`finally` 都停止候选并恢复 `/mnt/nvme0/start_glm53_3000.sh`；
 DeepSeek 身份变化或目标 GPU 出现未知进程则 fail-closed。
+
+门禁的运行期保护检查均通过，结束后另做现场核验：3000 已恢复为
+`GLM-5.3-Flash-tr3-4bpw`、监听
+`0.0.0.0:3000`、`max_model_len=524288`；3001 仍为原 DeepSeek PID 18519，且
+GPU `1,3,5,7` 的进程身份未变化。`SUMMARY.json` 只保存性能判定，不单独保存
+before/after 进程快照；进程隔离结论来自门禁成功控制流与上述现场核验。正式配置
+不切换至 AutoRound。
 
 ### 12.3 完整 warmup
 
