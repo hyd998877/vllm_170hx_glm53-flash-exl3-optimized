@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     VLLM_PP_ADAPTIVE_PREFILL: bool = False
     VLLM_PP_ADAPTIVE_PREFILL_MAX_TOKENS: int = 2048
     VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS: int = 1024
+    VLLM_PP_ADAPTIVE_PREFILL_DIAGNOSTICS: bool = False
     VLLM_EXL3_EXTENSION_DIR: str | None = None
     VLLM_EXL3_PACKAGE_ROOT: str | None = None
     VLLM_EXL3_MARLIN_DIR: str | None = None
@@ -908,6 +909,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS": lambda: int(
         os.getenv("VLLM_PP_ADAPTIVE_PREFILL_BUSY_TOKENS", "1024")
+    ),
+    "VLLM_PP_ADAPTIVE_PREFILL_DIAGNOSTICS": lambda: bool(
+        int(os.getenv("VLLM_PP_ADAPTIVE_PREFILL_DIAGNOSTICS", "0"))
     ),
     "VLLM_EXL3_EXTENSION_DIR": lambda: os.getenv("VLLM_EXL3_EXTENSION_DIR"),
     "VLLM_EXL3_PACKAGE_ROOT": lambda: os.getenv("VLLM_EXL3_PACKAGE_ROOT"),

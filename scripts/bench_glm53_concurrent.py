@@ -138,6 +138,11 @@ def stream_one(base: str, model: str, prompt: str, max_tokens: int, index: int):
         "top_p": stream_one.top_p,
         "top_k": stream_one.top_k,
         "ignore_eos": True,
+        # Text deltas are not a reliable token clock. Reasoning/tool parsers can
+        # buffer control tokens, and incremental detokenization may emit an empty
+        # string even though the engine produced tokens. Ask vLLM for the raw
+        # delta token IDs and use those events for TTFT/decode timing.
+        "return_token_ids": True,
         "stream": True,
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
@@ -151,6 +156,8 @@ def stream_one(base: str, model: str, prompt: str, max_tokens: int, index: int):
     first = last = None
     usage = None
     chunks = 0
+    text_chunks = 0
+    streamed_tokens = 0
     with urllib.request.urlopen(request, timeout=7200) as response:
         for raw in response:
             line = raw.decode("utf-8", "replace").strip()
@@ -163,15 +170,19 @@ def stream_one(base: str, model: str, prompt: str, max_tokens: int, index: int):
             if item.get("usage"):
                 usage = item["usage"]
             for choice in item.get("choices", ()):
+                token_ids = choice.get("token_ids") or ()
                 delta = choice.get("delta") or {}
-                text = (delta.get("content") or "") + (
+                delta_text = (delta.get("content") or "") + (
                     delta.get("reasoning_content") or delta.get("reasoning") or ""
                 )
-                if text:
+                if delta_text:
+                    text_chunks += 1
+                if token_ids:
                     now = time.perf_counter()
                     first = first or now
                     last = now
                     chunks += 1
+                    streamed_tokens += len(token_ids)
     end = time.perf_counter()
     prompt_tokens = (usage or {}).get("prompt_tokens")
     completion_tokens = (usage or {}).get("completion_tokens")
@@ -189,6 +200,8 @@ def stream_one(base: str, model: str, prompt: str, max_tokens: int, index: int):
         ),
         "wall_s": end - start,
         "chunks": chunks,
+        "text_chunks": text_chunks,
+        "streamed_tokens": streamed_tokens,
         "first_at": first,
         "last_at": last,
     }
@@ -304,9 +317,12 @@ def main() -> None:
     if any(
         result["prompt_tokens"] != args.prompt_tokens
         or result["completion_tokens"] != args.max_tokens
+        or result["streamed_tokens"] != args.max_tokens
         for result in results
     ):
-        raise RuntimeError("benchmark token counts differ from requested counts")
+        raise RuntimeError(
+            "benchmark usage/streamed token counts differ from requested counts"
+        )
     encoded = json.dumps(output, ensure_ascii=False, indent=2)
     print(encoded, flush=True)
     if args.out:

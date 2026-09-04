@@ -66,6 +66,10 @@ class AsyncScheduler(Scheduler):
         self._adaptive_prefill_request_id: str | None = None
         self._balanced_prefill_ids: set[str] = set()
         self._min_prefill_tokens_by_priority: dict[int, int] = {}
+        self._adaptive_prefill_diagnostics = (
+            envs.VLLM_PP_ADAPTIVE_PREFILL_DIAGNOSTICS
+        )
+        self._last_adaptive_prefill_ids: frozenset[str] = frozenset()
         if self._adaptive_prefill_enabled:
             if self.scheduler_config.long_prefill_token_threshold <= 0:
                 raise ValueError(
@@ -245,6 +249,24 @@ class AsyncScheduler(Scheduler):
         self._balanced_prefill_ids.clear()
         self._min_prefill_tokens_by_priority.clear()
         prefills = self._admissible_adaptive_prefills()
+        if self._adaptive_prefill_diagnostics:
+            prefill_ids = frozenset(request.request_id for request in prefills)
+            if prefill_ids != self._last_adaptive_prefill_ids:
+                progress = ", ".join(
+                    f"{request.request_id[-8:]}="
+                    f"{request.num_computed_tokens}/{request.num_prompt_tokens}:"
+                    f"{request.status.name}"
+                    for request in sorted(prefills, key=lambda item: item.arrival_time)
+                )
+                logger.info(
+                    "Adaptive PP prefill membership changed: prefills=%d "
+                    "running=%d waiting=%d progress=[%s]",
+                    len(prefills),
+                    len(self.running),
+                    len(self.waiting) + len(self.skipped_waiting),
+                    progress,
+                )
+                self._last_adaptive_prefill_ids = prefill_ids
         if len(prefills) < 2:
             return
 
