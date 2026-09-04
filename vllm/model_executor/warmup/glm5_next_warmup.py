@@ -58,7 +58,7 @@ def _warmup_mhc(layer: torch.nn.Module, max_tokens: int) -> None:
 
 
 def _warmup_indexer_kernels(model: torch.nn.Module) -> None:
-    """Compile kpool tail seed and the SM80 Triton MQA logits autotune cache."""
+    """Compile the GLM sparse-indexer kernels used by real serving buffers."""
     # The checkpoint has one indexer per sparse MLA layer.  The constants are
     # shared by all layers, so one representative module is sufficient.
     indexer = None
@@ -72,7 +72,10 @@ def _warmup_indexer_kernels(model: torch.nn.Module) -> None:
     device = indexer.index_kpool_compress_ape.device
     head_dim = int(indexer.head_dim)
     kpool = int(indexer.index_kpool)
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import kpool_seed_tail_cache
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        kpool_compress_and_write_cache,
+        kpool_seed_tail_cache,
+    )
 
     # Use the bound cache views when available.  The tail/cache block count and
     # physical strides are constexprs in the Triton kernels; a one-block dummy
@@ -88,9 +91,46 @@ def _warmup_indexer_kernels(model: torch.nn.Module) -> None:
     # Runtime slot mappings are int64.  Triton includes pointer element type in
     # its specialization key, so an int32 dummy compiles a cache entry that can
     # never be reused by serving.
-    tslot = torch.full((1,), -1, dtype=torch.int64, device=device)
-    kpool_seed_tail_cache(tail, key, gate, tslot, kpool, head_dim=head_dim)
-    del tail, key, gate, tslot
+    # Triton distinguishes aligned and unaligned tensor pointers.  Production
+    # metadata is commonly a slice into a shared int64 buffer (storage_offset
+    # > 0), while the old warmup allocated only an aligned one-element tensor.
+    # Prime both variants.  Negative slots take the no-write path, so the
+    # model's real tail cache remains untouched.
+    for offset in (0, 1):
+        tslot_storage = torch.full((2,), -1, dtype=torch.int64, device=device)
+        tslot = tslot_storage[offset : offset + 1]
+        kpool_seed_tail_cache(tail, key, gate, tslot, kpool, head_dim=head_dim)
+
+    # Prefill uses a separate fused softmax/rotate/quantize/cache-write kernel.
+    # Compile it against the bound cache: page size and physical page stride
+    # are constexprs and a small synthetic cache would therefore miss the
+    # serving specialization.  An all-false mask executes no stores.
+    bound_cache = getattr(getattr(indexer, "k_cache", None), "kv_cache", None)
+    if bound_cache is not None and bound_cache.numel() > 0:
+        slot_k = torch.zeros(
+            (1, kpool, head_dim), dtype=torch.bfloat16, device=device
+        )
+        slot_score = torch.zeros_like(slot_k)
+        ape = indexer.index_kpool_compress_ape.detach().float().contiguous()
+        write_mask = torch.zeros((1,), dtype=torch.bool, device=device)
+        for offset in (0, 1):
+            loc_storage = torch.full((2,), -1, dtype=torch.int64, device=device)
+            loc = loc_storage[offset : offset + 1]
+            kpool_compress_and_write_cache(
+                bound_cache,
+                slot_k,
+                slot_score,
+                ape,
+                loc,
+                pool_size=kpool,
+                head_dim=head_dim,
+                write_mask=write_mask,
+                round_scale=True,
+                return_compressed=False,
+                write_cache=True,
+            )
+        del slot_k, slot_score, ape, write_mask, loc, loc_storage
+    del tail, key, gate, tslot, tslot_storage
 
     # The SM80 fallback pads the checkpoint's 16 index heads to 32 before
     # dispatch.  Calling its public warmup helper primes both autotune and
@@ -102,7 +142,6 @@ def _warmup_indexer_kernels(model: torch.nn.Module) -> None:
 
     warmup_fp8_mqa_logits_triton(32, head_dim, device)
 
-    bound_cache = getattr(getattr(indexer, "k_cache", None), "kv_cache", None)
     if bound_cache is not None and bound_cache.numel() > 0:
         from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
             kv_cache_as_quant_view,
